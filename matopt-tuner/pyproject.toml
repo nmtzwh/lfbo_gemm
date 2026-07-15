@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "matopt-tuner"
+version = "0.1.0"
+description = "Out-of-tree search orchestration for the patched oneDNN MatOpt runner"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+lfbo = [
+    "numpy>=1.26,<3",
+    "scikit-learn>=1.4,<2",
+]
+
+[project.scripts]
+matopt-tuner = "matopt.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

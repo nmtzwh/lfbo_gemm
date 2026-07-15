@@ -1,0 +1,2867 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index adb97f4bd896014a351336313d8a87d395c50cfe..b2f7825bfd7c3c32cd38ba86ad7ea5d362e3ae5e 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -139,6 +139,16 @@ configure_file(
+ )
+ include_directories_with_host_compiler_before(${PROJECT_BINARY_DIR}/include)
+ 
++if(DNNL_BUILD_MATOPT)
++    if(NOT DNNL_LIBRARY_TYPE STREQUAL "STATIC")
++        message(FATAL_ERROR "DNNL_BUILD_MATOPT requires DNNL_LIBRARY_TYPE=STATIC")
++    endif()
++    if(NOT DNNL_CPU_THREADING_RUNTIME STREQUAL "OMP")
++        message(FATAL_ERROR "DNNL_BUILD_MATOPT requires DNNL_CPU_RUNTIME=OMP")
++    endif()
++    add_definitions_with_host_compiler(-DDNNL_BUILD_MATOPT=1)
++endif()
++
+ configure_file(
+     "${PROJECT_SOURCE_DIR}/README.binary.in"
+     "${PROJECT_BINARY_DIR}/README"
+@@ -156,6 +166,10 @@ add_subdirectory(src)
+ add_subdirectory(examples)
+ add_subdirectory(tests)
+ 
++if(DNNL_BUILD_MATOPT)
++    add_subdirectory(tools/matopt)
++endif()
++
+ if(DNNL_INSTALL_MODE STREQUAL "BUNDLE")
+     install(FILES LICENSE DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${LIB_PACKAGE_NAME})
+     install(FILES THIRD-PARTY-PROGRAMS DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${LIB_PACKAGE_NAME})
+diff --git a/cmake/options.cmake b/cmake/options.cmake
+index 0cf7585eff81473ab24f6d773cd1b88daf5d4b4d..8c37e73803d6e91ba375ac8258bfcb396a52ef20 100644
+--- a/cmake/options.cmake
++++ b/cmake/options.cmake
+@@ -72,6 +72,8 @@ set(ONEDNN_DOC_VERSIONS_JSON "" CACHE STRING "Location of JSON file for
+ 
+ option(DNNL_BUILD_EXAMPLES "builds examples" ${DNNL_IS_MAIN_PROJECT})
+ option(DNNL_BUILD_TESTS "builds tests" ${DNNL_IS_MAIN_PROJECT})
++option(DNNL_BUILD_MATOPT
++    "builds the non-installed offline BRGEMM MatMul optimizer" OFF)
+ option(DNNL_BUILD_FOR_CI
+     "specifies whether oneDNN library will use special testing environment for
+     internal testing processes"
+diff --git a/src/cpu/CMakeLists.txt b/src/cpu/CMakeLists.txt
+index 7a0b20c47f84985022f31569cefa2b54f329648e..f7798d34029fe9febebf1c1a5cdfccd024d4cd6d 100644
+--- a/src/cpu/CMakeLists.txt
++++ b/src/cpu/CMakeLists.txt
+@@ -29,6 +29,14 @@ foreach(SOURCE_FILE ${SOURCES_EXTRA})
+     list(APPEND SOURCES "${SOURCE_FILE}")
+ endforeach()
+ 
++# The adapter is present only in the opt-in static build. It must live in that
++# archive because the guarded architecture objects refer to it and are also
++# exercised by ordinary oneDNN regression executables.
++if(NOT DNNL_BUILD_MATOPT)
++    list(REMOVE_ITEM SOURCES
++        "${CMAKE_CURRENT_SOURCE_DIR}/matmul/matopt_backend.cpp")
++endif()
++
+ if((DNNL_TARGET_ARCH STREQUAL "X64") OR (DNNL_TARGET_ARCH STREQUAL "AARCH64") OR (DNNL_TARGET_ARCH STREQUAL "RV64"))
+     file(GLOB_RECURSE SOURCES_JIT_UTILS
+         ${CMAKE_CURRENT_SOURCE_DIR}/jit_utils/*.[ch]
+diff --git a/src/cpu/aarch64/brgemm/brgemm_utils.cpp b/src/cpu/aarch64/brgemm/brgemm_utils.cpp
+index 885aae610640b290d4e4ae42fe4a61f4ab02d3ea..bfe8a03892c4cbcb76141102c687f67f086870f2 100644
+--- a/src/cpu/aarch64/brgemm/brgemm_utils.cpp
++++ b/src/cpu/aarch64/brgemm/brgemm_utils.cpp
+@@ -192,21 +192,34 @@ status_t brgemm_blocking(brgemm_desc_t *brg) {
+     brg->ldb = brg->load_dim / brg->ld_block;
+     brg->ldb_tail = brg->load_dim % brg->ld_block;
+ 
+-    int adj_ld_block2 = calculate_ldb_params(brg, 4);
++    const int requested_ld_block2 = brg->brgattr.hint_ld_block2;
++    if (requested_ld_block2 < 0 || requested_ld_block2 > 4)
++        return status::invalid_arguments;
++    int adj_ld_block2 = calculate_ldb_params(
++            brg, requested_ld_block2 ? requested_ld_block2 : 4);
+     int max_bcast_block = calculate_max_bcast_block(brg, adj_ld_block2);
+ 
++    const int requested_bd_block = brg->brgattr.hint_bd_block;
++
+     // reduce 'ld_block2' to allow a larger 'bd_block'
+     const int max_vpad = nstl::max(
+             brg->brgattr.max_top_vpad, brg->brgattr.max_bottom_vpad);
+     if (max_bcast_block < max_vpad) {
++        if (requested_ld_block2) return status::invalid_arguments;
+         adj_ld_block2 = calculate_ldb_params(brg, 2);
+         max_bcast_block = calculate_max_bcast_block(brg, adj_ld_block2);
+     }
++    if (requested_bd_block < 0 || requested_bd_block > max_bcast_block
++            || requested_bd_block > brg->bcast_dim)
++        return status::invalid_arguments;
+ 
+     const int min_block = 1;
+     float best_bd_block_eff = 0.f;
+-    brg->bd_block = 1;
+-    for (int bd_block = max_bcast_block; bd_block >= min_block; bd_block--) {
++    brg->bd_block = requested_bd_block ? requested_bd_block : 1;
++    for (int bd_block
++            = requested_bd_block ? requested_bd_block : max_bcast_block;
++            bd_block >= (requested_bd_block ? requested_bd_block : min_block);
++            bd_block--) {
+         const auto bd_block_disb = static_cast<float>(brg->bcast_dim)
+                 / rnd_up(brg->bcast_dim, bd_block);
+         const auto brgemm_microkernel_eff
+@@ -223,6 +236,8 @@ status_t brgemm_blocking(brgemm_desc_t *brg) {
+             best_bd_block_eff = bd_block_eff;
+         }
+     }
++    if (requested_bd_block && best_bd_block_eff == 0.f)
++        return status::invalid_arguments;
+     brg->bdb = brg->bcast_dim / brg->bd_block;
+     brg->bdb_tail = brg->bcast_dim % brg->bd_block;
+ 
+diff --git a/src/cpu/aarch64/matmul/brgemm_matmul.cpp b/src/cpu/aarch64/matmul/brgemm_matmul.cpp
+index bfc4187759f564bb85362ae64aa995b5a133ef7b..485309a43444fdf5a8f62fbcd2ae14a0b01946a9 100644
+--- a/src/cpu/aarch64/matmul/brgemm_matmul.cpp
++++ b/src/cpu/aarch64/matmul/brgemm_matmul.cpp
+@@ -28,6 +28,9 @@
+ 
+ #include "cpu/aarch64/injectors/jit_uni_binary_injector.hpp"
+ #include "cpu/aarch64/matmul/brgemm_matmul.hpp"
++#if DNNL_BUILD_MATOPT
++#include "cpu/matmul/matopt_backend.hpp"
++#endif
+ 
+ namespace dnnl {
+ namespace impl {
+@@ -215,10 +218,28 @@ status_t brgemm_matmul_t<isa>::pd_t::init(engine_t *engine) {
+         brgemm_attr_t brgattr;
+         brgattr.generate_skip_accumulation
+                 = bgmmc_.post_ops_applicable && bgmmc_.nthr_k > 1;
++#if DNNL_BUILD_MATOPT
++        const auto *matopt_plan = matopt::active_plan();
++        const bool matopt_full_desc
++                = i_bs == 0 && i_M == 0 && i_N == 0 && i_K == 0;
++        if (matopt_plan && matopt_full_desc) {
++            brgattr.hint_bd_block = matopt_plan->bd_block;
++            brgattr.hint_ld_block2 = matopt_plan->ld_block2;
++            brgattr.hint_loop_order
++                    = matopt_plan->loop_order == matopt::loop_order_t::one_load
++                    ? brgemm_lo_bl_1load
++                    : brgemm_lo_default;
++        }
++#endif
+ 
+         CHECK(brgemm_desc_set_attr(&brg, brgattr));
+ 
+         CHECK(brgemm_desc_finalize(&brg));
++#if DNNL_BUILD_MATOPT
++        if (i_bs == 0 && i_M == 0 && i_N == 0 && i_K == 0)
++            matopt::capture_microtile(
++                    brg.bd_block, brg.ld_block2, brg.get_wsp_buffer_size());
++#endif
+ 
+         bgmmc_.wsp_tile_per_thr_bytes = nstl::max(
+                 brg.get_wsp_buffer_size(), bgmmc_.wsp_tile_per_thr_bytes);
+diff --git a/src/cpu/aarch64/matmul/brgemm_matmul_copy_utils.cpp b/src/cpu/aarch64/matmul/brgemm_matmul_copy_utils.cpp
+index 805a47147f374fcb6448a7b220b6794a59e289cd..923565ce3294bdd3c8eec8ff25c09eedb28b96cf 100644
+--- a/src/cpu/aarch64/matmul/brgemm_matmul_copy_utils.cpp
++++ b/src/cpu/aarch64/matmul/brgemm_matmul_copy_utils.cpp
+@@ -24,6 +24,10 @@
+ #include "xbyak_aarch64/xbyak_aarch64/xbyak_aarch64_reg.h"
+ 
+ #include "cpu/aarch64/matmul/brgemm_matmul_copy_utils.hpp"
++#if DNNL_BUILD_MATOPT
++#include "cpu/matmul/matopt_backend.hpp"
++#include "cpu/matmul/matopt_copy_a.hpp"
++#endif
+ 
+ namespace dnnl {
+ namespace impl {
+@@ -232,6 +236,23 @@ void jit_brgemm_matmul_copy_a_impl_t<isa>::generate() {
+ template struct jit_brgemm_matmul_copy_a_impl_t<sve_512>;
+ template struct jit_brgemm_matmul_copy_a_impl_t<sve_256>;
+ 
++#if DNNL_BUILD_MATOPT
++struct matopt_brgemm_matmul_copy_a_f32_t : public jit_brgemm_matmul_copy_a_t {
++    matopt_brgemm_matmul_copy_a_f32_t(const brgemm_matmul_conf_t *conf)
++        : jit_brgemm_matmul_copy_a_t(conf) {}
++
++    void operator()(ctx_t *ctx) override {
++        const dim_t src_stride = ctx->dynamic_src_ld > 0
++                ? ctx->dynamic_src_ld
++                : conf_->copy_A_src_stride;
++        cpu::matopt::copy_a_f32(ctx->src, const_cast<void *>(ctx->tr_src),
++                ctx->current_M_blk, ctx->current_K_blk, src_stride, conf_->LDA);
++    }
++
++    status_t create_kernel() override { return status::success; }
++};
++#endif
++
+ struct jit_brgemm_matmul_copy_a_transposed_impl_t
+     : public jit_brgemm_matmul_copy_a_t,
+       public jit_generator_t {
+@@ -1139,6 +1160,21 @@ status_t create_brgemm_matmul_copy_b(
+ status_t create_brgemm_matmul_copy_a(
+         std::unique_ptr<jit_brgemm_matmul_copy_a_t> &copy_ker,
+         const brgemm_matmul_conf_t *conf) {
++#if DNNL_BUILD_MATOPT
++    // The upstream AArch64 plain copy-A JIT is still under construction. The
++    // MatOpt MVP only needs dense FP32 without compensation, so use a native
++    // row copy for that exact domain instead of entering the stub JIT.
++    const auto *matopt_plan = dnnl::impl::cpu::matopt::active_plan();
++    const bool matopt_padded_a = matopt_plan
++            && matopt_plan->pack_a
++                    == dnnl::impl::cpu::matopt::pack_a_t::per_call_padded;
++    if (matopt_padded_a && !conf->transposed_A && conf->src_dt == data_type::f32
++            && conf->tr_a_dt_sz == sizeof(float) && !conf->has_zero_point_b) {
++        CHECK(safe_ptr_assign(
++                copy_ker, new matopt_brgemm_matmul_copy_a_f32_t(conf)));
++        return copy_ker->create_kernel();
++    }
++#endif
+     if (conf->transposed_A) {
+         CHECK(safe_ptr_assign(copy_ker,
+                 new jit_brgemm_matmul_copy_a_transposed_impl_t(conf)));
+diff --git a/src/cpu/aarch64/matmul/brgemm_matmul_utils.cpp b/src/cpu/aarch64/matmul/brgemm_matmul_utils.cpp
+index 87aabed00361554548abb4bd4125355d86595e38..a436a0273d23e6ba37feef559743838bfa60e25d 100644
+--- a/src/cpu/aarch64/matmul/brgemm_matmul_utils.cpp
++++ b/src/cpu/aarch64/matmul/brgemm_matmul_utils.cpp
+@@ -17,6 +17,9 @@
+ *******************************************************************************/
+ 
+ #include "cpu/aarch64/matmul/brgemm_matmul_utils.hpp"
++#if DNNL_BUILD_MATOPT
++#include "cpu/matmul/matopt_backend.hpp"
++#endif
+ #include "common/c_types_map.hpp"
+ #include "common/dnnl_thread.hpp"
+ #include "common/type_helpers.hpp"
+@@ -1078,6 +1081,11 @@ status_t init_brgemm_matmul_conf(cpu_isa_t isa, brgemm_matmul_conf_t &bgmmc,
+     // - nthr_K
+     VCHECK_BG(compute_blocking_heuristic(bgmmc, bm_conf_utils),
+             VERBOSE_BLOCKING_FAIL, "");
++#if DNNL_BUILD_MATOPT
++    // The AArch64 BRGEMM MatMul split-K path is not safe for explicit matopt
++    // configurations yet. Reject it before recomputing any derived state.
++    VCHECK_BG(matopt::apply_plan(bgmmc, false), VERBOSE_BLOCKING_FAIL, "");
++#endif
+ 
+     if (bgmmc.wei_n_blk > bgmmc.N_blk
+             && IMPLICATION(
+@@ -1106,6 +1114,9 @@ status_t init_brgemm_matmul_conf(cpu_isa_t isa, brgemm_matmul_conf_t &bgmmc,
+             = bgmmc.use_buffer_c && bgmmc.nthr_k <= 1 ? bgmmc.N_blk : bgmmc.LDD;
+ 
+     init_aux_values(bgmmc, src_d, weights_d, dst_d);
++#if DNNL_BUILD_MATOPT
++    matopt::capture(bgmmc);
++#endif
+ 
+     return status::success;
+ }
+diff --git a/src/cpu/matmul/matopt_backend.cpp b/src/cpu/matmul/matopt_backend.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..2283305ab2b4c0fc6815a38bfde1f741c3832382
+--- /dev/null
++++ b/src/cpu/matmul/matopt_backend.cpp
+@@ -0,0 +1,64 @@
++/*******************************************************************************
++* Copyright 2026
++*
++* Licensed under the Apache License, Version 2.0 (the "License");
++******************************************************************************/
++
++#include "cpu/matmul/matopt_backend.hpp"
++
++namespace dnnl {
++namespace impl {
++namespace cpu {
++namespace matopt {
++
++namespace {
++thread_local const plan_t *current_plan = nullptr;
++thread_local finalized_plan_t captured;
++thread_local bool captured_valid = false;
++thread_local std::string last_error;
++} // namespace
++
++scoped_plan_t::scoped_plan_t(const plan_t *plan) : previous_(current_plan) {
++    current_plan = plan;
++    last_error.clear();
++}
++
++scoped_plan_t::~scoped_plan_t() {
++    current_plan = previous_;
++}
++
++const plan_t *active_plan() {
++    return current_plan;
++}
++void clear_capture() {
++    captured = finalized_plan_t();
++    captured_valid = false;
++    last_error.clear();
++}
++bool get_capture(finalized_plan_t &out) {
++    if (!captured_valid) return false;
++    out = captured;
++    return true;
++}
++void set_error(const std::string &message) {
++    last_error = message;
++}
++std::string get_error() {
++    return last_error;
++}
++void publish_capture(const finalized_plan_t &value) {
++    captured = value;
++    captured_valid = true;
++}
++void capture_microtile(int bd_block, int ld_block2, size_t scratchpad_bytes) {
++    if (!captured_valid) return;
++    captured.realized_bd_block = bd_block;
++    captured.realized_ld_block2 = ld_block2;
++    if (scratchpad_bytes > captured.scratchpad_bytes)
++        captured.scratchpad_bytes = scratchpad_bytes;
++}
++
++} // namespace matopt
++} // namespace cpu
++} // namespace impl
++} // namespace dnnl
+diff --git a/src/cpu/matmul/matopt_backend.hpp b/src/cpu/matmul/matopt_backend.hpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..d2fa81e4fa675a2fe093ffe9bec351f1ab22d64f
+--- /dev/null
++++ b/src/cpu/matmul/matopt_backend.hpp
+@@ -0,0 +1,203 @@
++/*******************************************************************************
++* Copyright 2026
++*
++* Licensed under the Apache License, Version 2.0 (the "License");
++******************************************************************************/
++
++#ifndef CPU_MATMUL_MATOPT_BACKEND_HPP
++#define CPU_MATMUL_MATOPT_BACKEND_HPP
++
++#include <cstdint>
++#include <string>
++
++#include "common/c_types_map.hpp"
++
++namespace dnnl {
++namespace impl {
++namespace cpu {
++namespace matopt {
++
++constexpr uint32_t schema_version = 1;
++
++enum class pack_a_t { direct, per_call_padded };
++enum class pack_b_t {
++    direct,
++    per_call_n32,
++    per_call_n64,
++    persistent_n32,
++    persistent_n64
++};
++enum class loop_order_t { default_order, one_load };
++
++struct plan_t {
++    uint32_t version = schema_version;
++    int M_blk = 0;
++    int N_blk = 0;
++    int K_blk = 0;
++    int M_chunk_size = 0;
++    int N_chunk_size = 0;
++    int K_chunk_size = 0;
++    int brgemm_batch_size = 0;
++    int nthr_k = 0;
++    pack_a_t pack_a = pack_a_t::direct;
++    pack_b_t pack_b = pack_b_t::direct;
++    int bd_block = 0;
++    int ld_block2 = 0;
++    loop_order_t loop_order = loop_order_t::default_order;
++};
++
++struct finalized_plan_t : public plan_t {
++    int64_t M = 0, N = 0, K = 0;
++    int64_t M_tail = 0, N_tail = 0, K_tail = 0;
++    int64_t LDA = 0, LDB = 0, LDC = 0;
++    int M_chunks = 0, N_chunks = 0, K_chunks = 0;
++    int realized_bd_block = 0;
++    int realized_ld_block2 = 0;
++    bool use_buffer_a = false;
++    bool use_buffer_b = false;
++    bool blocked_B = false;
++    size_t scratchpad_bytes = 0;
++};
++
++class scoped_plan_t {
++public:
++    explicit scoped_plan_t(const plan_t *plan);
++    ~scoped_plan_t();
++    scoped_plan_t(const scoped_plan_t &) = delete;
++    scoped_plan_t &operator=(const scoped_plan_t &) = delete;
++
++private:
++    const plan_t *previous_;
++};
++
++const plan_t *active_plan();
++void clear_capture();
++bool get_capture(finalized_plan_t &out);
++void set_error(const std::string &message);
++std::string get_error();
++
++template <typename conf_t>
++status_t apply_plan(conf_t &c, bool allow_split_k = true) {
++    const plan_t *p = active_plan();
++    if (!p) return status::success;
++    if (p->version != schema_version) {
++        set_error("unsupported plan schema version");
++        return status::invalid_arguments;
++    }
++    if (p->M_blk <= 0 || p->N_blk <= 0 || p->K_blk <= 0 || p->M_chunk_size <= 0
++            || p->N_chunk_size <= 0 || p->brgemm_batch_size <= 0
++            || p->nthr_k <= 0) {
++        set_error("blocking and chunk fields must be positive");
++        return status::invalid_arguments;
++    }
++    if (!allow_split_k && p->nthr_k != 1) {
++        set_error("split-K tuning is disabled on AArch64");
++        return status::invalid_arguments;
++    }
++    if (p->K_blk % c.required_k_granularity != 0) {
++        set_error("K_blk violates the backend K granularity");
++        return status::invalid_arguments;
++    }
++    if (c.nthr % p->nthr_k != 0) {
++        set_error("nthr_k must divide the requested thread count");
++        return status::invalid_arguments;
++    }
++    const int64_t k_blocks
++            = (c.K + p->K_blk - 1) / static_cast<int64_t>(p->K_blk);
++    if (p->brgemm_batch_size > k_blocks) {
++        set_error("BRGEMM batch size exceeds the number of K blocks");
++        return status::invalid_arguments;
++    }
++    const int64_t k_chunks
++            = (k_blocks + p->brgemm_batch_size - 1) / p->brgemm_batch_size;
++    if (p->nthr_k > k_chunks) {
++        set_error("nthr_k exceeds the number of K chunks");
++        return status::invalid_arguments;
++    }
++    if (p->M_blk > c.M || p->N_blk > c.N || p->K_blk > c.K) {
++        set_error("macro block exceeds its workload dimension");
++        return status::invalid_arguments;
++    }
++    if (p->pack_a == pack_a_t::direct && c.transposed_A) {
++        set_error("direct A is incompatible with a transposed source");
++        return status::invalid_arguments;
++    }
++    const bool persistent = p->pack_b == pack_b_t::persistent_n32
++            || p->pack_b == pack_b_t::persistent_n64;
++    if (persistent && !c.blocked_B) {
++        set_error("persistent B requires a blocked weights descriptor");
++        return status::invalid_arguments;
++    }
++
++    c.M_blk = p->M_blk;
++    c.N_blk = p->N_blk;
++    c.K_blk = p->K_blk;
++    c.M_chunk_size = p->M_chunk_size;
++    c.N_chunk_size = p->N_chunk_size;
++    c.brgemm_batch_size = p->brgemm_batch_size;
++    c.nthr_k = p->nthr_k;
++    c.use_buffer_a = p->pack_a == pack_a_t::per_call_padded;
++    c.use_buffer_b = p->pack_b == pack_b_t::per_call_n32
++            || p->pack_b == pack_b_t::per_call_n64;
++    const bool n32 = p->pack_b == pack_b_t::per_call_n32
++            || p->pack_b == pack_b_t::persistent_n32;
++    const bool n64 = p->pack_b == pack_b_t::per_call_n64
++            || p->pack_b == pack_b_t::persistent_n64;
++    if ((n32 && p->N_blk != 32) || (n64 && p->N_blk != 64)) {
++        set_error("B packing policy and N_blk disagree");
++        return status::invalid_arguments;
++    }
++
++    const int64_t k_chunk_elems
++            = static_cast<int64_t>(c.K_blk) * c.brgemm_batch_size;
++    c.use_buffer_c = c.nthr_k > 1 && c.K > k_chunk_elems;
++    if (c.use_buffer_a) {
++        const int64_t elems = 64 / c.tr_a_dt_sz;
++        c.LDA = ((c.K_blk + elems - 1) / elems) * elems;
++        if (c.LDA >= 512 && (c.LDA & (c.LDA - 1)) == 0) c.LDA += elems;
++    } else {
++        c.LDA = c.A_strides[1] / c.a_dt_sz;
++    }
++    return status::success;
++}
++
++template <typename conf_t>
++void capture(const conf_t &c) {
++    finalized_plan_t f;
++    const plan_t *p = active_plan();
++    if (p) static_cast<plan_t &>(f) = *p;
++    f.M = c.M;
++    f.N = c.N;
++    f.K = c.K;
++    f.M_blk = static_cast<int>(c.M_blk);
++    f.N_blk = static_cast<int>(c.N_blk);
++    f.K_blk = static_cast<int>(c.K_blk);
++    f.M_chunk_size = c.M_chunk_size;
++    f.N_chunk_size = c.N_chunk_size;
++    f.K_chunk_size = 1;
++    f.brgemm_batch_size = c.brgemm_batch_size;
++    f.nthr_k = c.nthr_k;
++    f.M_tail = c.M_tail;
++    f.N_tail = c.N_tail;
++    f.K_tail = c.K_tail;
++    f.LDA = c.LDA;
++    f.LDB = c.LDB;
++    f.LDC = c.LDC;
++    f.M_chunks = c.M_chunks;
++    f.N_chunks = c.N_chunks;
++    f.K_chunks = c.K_chunks;
++    f.use_buffer_a = c.use_buffer_a;
++    f.use_buffer_b = c.use_buffer_b;
++    f.blocked_B = c.blocked_B;
++    extern void publish_capture(const finalized_plan_t &);
++    publish_capture(f);
++}
++
++void capture_microtile(int bd_block, int ld_block2, size_t scratchpad_bytes);
++
++} // namespace matopt
++} // namespace cpu
++} // namespace impl
++} // namespace dnnl
++
++#endif
+diff --git a/src/cpu/matmul/matopt_copy_a.hpp b/src/cpu/matmul/matopt_copy_a.hpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..fd6cc68d79c24e0b49360a8f5785c7aafb127abe
+--- /dev/null
++++ b/src/cpu/matmul/matopt_copy_a.hpp
+@@ -0,0 +1,44 @@
++/*******************************************************************************
++* Copyright 2026
++* Licensed under the Apache License, Version 2.0 (the "License");
++*******************************************************************************/
++
++#ifndef CPU_MATMUL_MATOPT_COPY_A_HPP
++#define CPU_MATMUL_MATOPT_COPY_A_HPP
++
++#include <cassert>
++#include <cstddef>
++#include <cstring>
++
++#include "common/c_types_map.hpp"
++
++namespace dnnl {
++namespace impl {
++namespace cpu {
++namespace matopt {
++
++// Correctness-first dense FP32 copy used by the AArch64 MatOpt padded-A path
++// until its currently stubbed SVE copy-A JIT is implemented. Strides are in
++// bytes for the source and in FP32 elements for the destination.
++inline void copy_a_f32(const void *src, void *dst, dim_t rows, dim_t columns,
++        dim_t src_stride_bytes, dim_t dst_ld) {
++    assert(rows >= 0 && columns >= 0 && dst_ld >= columns);
++    const size_t copied_bytes = static_cast<size_t>(columns) * sizeof(float);
++    const size_t padded_bytes
++            = static_cast<size_t>(dst_ld - columns) * sizeof(float);
++    const char *src_row = static_cast<const char *>(src);
++    char *dst_row = static_cast<char *>(dst);
++    for (dim_t m = 0; m < rows; ++m) {
++        std::memcpy(dst_row, src_row, copied_bytes);
++        if (padded_bytes) std::memset(dst_row + copied_bytes, 0, padded_bytes);
++        src_row += src_stride_bytes;
++        dst_row += static_cast<size_t>(dst_ld) * sizeof(float);
++    }
++}
++
++} // namespace matopt
++} // namespace cpu
++} // namespace impl
++} // namespace dnnl
++
++#endif
+diff --git a/src/cpu/x64/brgemm/brgemm_utils.cpp b/src/cpu/x64/brgemm/brgemm_utils.cpp
+index 1dfeedd56ca00b6e14e890782e7fa97fd13df8b9..da0991c916809b0de6f4f9872da870ac4c2a25c1 100644
+--- a/src/cpu/x64/brgemm/brgemm_utils.cpp
++++ b/src/cpu/x64/brgemm/brgemm_utils.cpp
+@@ -768,7 +768,11 @@ status_t brgemm_blocking_vmm(brgemm_desc_t *brg) {
+     bool few_regs = utils::one_of(brg->isa_impl, avx2, avx2_vnni, avx2_vnni_2);
+     bool hint_n_bcast_1_load
+             = brg->brgattr.hint_loop_order == brgemm_lo_bl_1load;
+-    for (int try_ld_block2 = 4; try_ld_block2 > 0; --try_ld_block2) {
++    const int requested_ld_block2 = brg->brgattr.hint_ld_block2;
++    if (requested_ld_block2 < 0 || requested_ld_block2 > 4)
++        return status::invalid_arguments;
++    for (int try_ld_block2 = requested_ld_block2 ? requested_ld_block2 : 4;
++            try_ld_block2 > 0; --try_ld_block2) {
+         adj_ld_block2 = calculate_ldb_params(brg, try_ld_block2);
+         brg->n_bcast_1_load
+                 = (few_regs && adj_ld_block2 == 4) || hint_n_bcast_1_load;
+@@ -776,6 +780,7 @@ status_t brgemm_blocking_vmm(brgemm_desc_t *brg) {
+         const auto bdb_tail = brg->bcast_dim % max_bcast_block;
+         min_bcast_block = bdb_tail > 0 ? bdb_tail : max_bcast_block;
+         if (min_bcast_block >= max_vpad) break;
++        if (requested_ld_block2) return status::invalid_arguments;
+     }
+     // bcast block in brgemm kernel should be greater than virtual
+     // padding to avoid possible functional issues
+@@ -783,9 +788,17 @@ status_t brgemm_blocking_vmm(brgemm_desc_t *brg) {
+ 
+     const int min_block = nstl::max(1, max_vpad);
+ 
++    const int requested_bd_block = brg->brgattr.hint_bd_block;
++    if (requested_bd_block < 0 || requested_bd_block > max_bcast_block
++            || requested_bd_block > brg->bcast_dim)
++        return status::invalid_arguments;
++
+     float best_bd_block_eff = 0.f;
+-    brg->bd_block = max_bcast_block;
+-    for (int bd_block = max_bcast_block; bd_block >= min_block; bd_block--) {
++    brg->bd_block = requested_bd_block ? requested_bd_block : max_bcast_block;
++    for (int bd_block
++            = requested_bd_block ? requested_bd_block : max_bcast_block;
++            bd_block >= (requested_bd_block ? requested_bd_block : min_block);
++            bd_block--) {
+         // avoid msvc warning 'potential divide by zero'
+         const auto bd_block_disb = (brg->bcast_dim <= 0 || bd_block == 0)
+                 ? 0.f
+@@ -804,6 +817,8 @@ status_t brgemm_blocking_vmm(brgemm_desc_t *brg) {
+             best_bd_block_eff = bd_block_eff;
+         }
+     }
++    if (requested_bd_block && best_bd_block_eff == 0.f)
++        return status::invalid_arguments;
+     brg->bdb = brg->bcast_dim / brg->bd_block;
+     brg->bdb_tail = brg->bcast_dim % brg->bd_block;
+ 
+diff --git a/src/cpu/x64/matmul/brgemm_matmul.cpp b/src/cpu/x64/matmul/brgemm_matmul.cpp
+index e42a43699b817054b09b236e81b4c57ca23186c8..2f78bbb4eb9f9900b18a2a255800063e41dfd652 100644
+--- a/src/cpu/x64/matmul/brgemm_matmul.cpp
++++ b/src/cpu/x64/matmul/brgemm_matmul.cpp
+@@ -28,6 +28,9 @@
+ #include "cpu/x64/amx_tile_configure.hpp"
+ #include "cpu/x64/injectors/jit_uni_binary_injector.hpp"
+ #include "cpu/x64/matmul/brgemm_matmul.hpp"
++#if DNNL_BUILD_MATOPT
++#include "cpu/matmul/matopt_backend.hpp"
++#endif
+ 
+ // This is required to implement `can_use_gemm_fallback`.
+ #include "cpu/matmul/gemm_bf16_matmul.hpp"
+@@ -412,6 +415,19 @@ status_t brgemm_matmul_t<isa>::pd_t::init(engine_t *engine) {
+         brgattr.mem_advice = bgmmc_.mem_advice;
+         brgattr.max_bs = bs;
+         brgattr.hint_prefetchw = bgmmc_.hint_prefetchw;
++#if DNNL_BUILD_MATOPT
++        const auto *matopt_plan = matopt::active_plan();
++        const bool matopt_full_desc
++                = i_bs == 0 && i_M == 0 && i_N == 0 && i_K == 0;
++        if (matopt_plan && matopt_full_desc) {
++            brgattr.hint_bd_block = matopt_plan->bd_block;
++            brgattr.hint_ld_block2 = matopt_plan->ld_block2;
++            brgattr.hint_loop_order
++                    = matopt_plan->loop_order == matopt::loop_order_t::one_load
++                    ? brgemm_lo_bl_1load
++                    : brgemm_lo_default;
++        }
++#endif
+         if (is_superset(kernel_isa, avx512_core_amx)) {
+             brgattr.use_uker = true;
+             brgattr.use_interleave_stores = true;
+@@ -443,6 +459,11 @@ status_t brgemm_matmul_t<isa>::pd_t::init(engine_t *engine) {
+ 
+         CHECK(brgemm_desc_set_attr(&brg, brgattr));
+         CHECK(brgemm_desc_finalize(&brg));
++#if DNNL_BUILD_MATOPT
++        if (i_bs == 0 && i_M == 0 && i_N == 0 && i_K == 0)
++            matopt::capture_microtile(
++                    brg.bd_block, brg.ld_block2, brg.get_wsp_buffer_size());
++#endif
+ 
+         bgmmc_.wsp_tile_per_thr_bytes = nstl::max(
+                 brg.get_wsp_buffer_size(), bgmmc_.wsp_tile_per_thr_bytes);
+diff --git a/src/cpu/x64/matmul/brgemm_matmul_utils.cpp b/src/cpu/x64/matmul/brgemm_matmul_utils.cpp
+index 9996347a62db5f49c28697dec64eb23a83278cd6..b69a37672340ece40cd4e188e1fad1a1e96e84eb 100644
+--- a/src/cpu/x64/matmul/brgemm_matmul_utils.cpp
++++ b/src/cpu/x64/matmul/brgemm_matmul_utils.cpp
+@@ -24,6 +24,9 @@
+ #include "cpu/x64/injectors/jit_uni_postops_injector.hpp"
+ #include "cpu/x64/matmul/amx_blocking_heuristics.hpp"
+ #include "cpu/x64/matmul/brgemm_matmul_utils.hpp"
++#if DNNL_BUILD_MATOPT
++#include "cpu/matmul/matopt_backend.hpp"
++#endif
+ #include "cpu/x64/matmul/postops_estimator.hpp"
+ #include "oneapi/dnnl/dnnl_debug.h"
+ 
+@@ -1814,6 +1817,9 @@ status_t init_brgemm_matmul_conf(cpu_isa_t isa, brgemm_matmul_conf_t &bgmmc,
+     // - nthr_K
+     VCHECK_BG(compute_blocking_heuristic(bgmmc, bm_conf_utils),
+             VERBOSE_BLOCKING_FAIL, "");
++#if DNNL_BUILD_MATOPT
++    VCHECK_BG(matopt::apply_plan(bgmmc), VERBOSE_BLOCKING_FAIL, "");
++#endif
+ 
+     if (bgmmc.wei_n_blk > bgmmc.N_blk && bgmmc.N != bgmmc.N_blk) {
+         assert(!bgmmc.is_runtime_N
+@@ -1877,6 +1883,9 @@ status_t init_brgemm_matmul_conf(cpu_isa_t isa, brgemm_matmul_conf_t &bgmmc,
+ 
+     // Sets things related to chunks and others
+     init_aux_values(bgmmc, src_d, weights_d, dst_d);
++#if DNNL_BUILD_MATOPT
++    matopt::capture(bgmmc);
++#endif
+ 
+     const bool need_store_prfw = bgmmc.N <= 14528
+             && ((bgmmc.M <= 768 && bgmmc.K <= 128)
+diff --git a/tools/matopt/CMakeLists.txt b/tools/matopt/CMakeLists.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..8ac192a1a55614de68785ad16ebadff898dd1f5f
+--- /dev/null
++++ b/tools/matopt/CMakeLists.txt
+@@ -0,0 +1,26 @@
++# matopt is intentionally not installed: it consumes oneDNN internal APIs.
++add_library(matopt_backend_adapter INTERFACE)
++target_include_directories(matopt_backend_adapter INTERFACE
++    ${PROJECT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/src)
++target_link_libraries(matopt_backend_adapter INTERFACE ${LIB_PACKAGE_NAME})
++
++add_library(matopt_core STATIC matopt_core.cpp)
++target_include_directories(matopt_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
++target_link_libraries(matopt_core PUBLIC matopt_backend_adapter)
++
++add_executable(matopt main.cpp)
++target_link_libraries(matopt PRIVATE matopt_core)
++
++# Protocol runner used by the out-of-tree Python tuner. Keep the legacy
++# executable during migration as the deterministic search oracle.
++add_executable(matopt_runner main.cpp)
++set_target_properties(matopt_runner PROPERTIES OUTPUT_NAME matopt-runner)
++target_link_libraries(matopt_runner PRIVATE matopt_core)
++
++add_executable(matopt_tests test_matopt.cpp)
++target_link_libraries(matopt_tests PRIVATE matopt_core)
++add_test(NAME matopt_unit COMMAND matopt_tests)
++
++add_executable(matopt_backend_tests test_backend.cpp)
++target_link_libraries(matopt_backend_tests PRIVATE matopt_core)
++add_test(NAME matopt_backend COMMAND matopt_backend_tests)
+diff --git a/tools/matopt/main.cpp b/tools/matopt/main.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..ab816204e32cbb74af86c29174e6eb32e7128884
+--- /dev/null
++++ b/tools/matopt/main.cpp
+@@ -0,0 +1,1071 @@
++/*******************************************************************************
++* Copyright 2026
++* Licensed under the Apache License, Version 2.0 (the "License");
++******************************************************************************/
++#include "matopt_core.hpp"
++
++#include <algorithm>
++#include <cctype>
++#include <chrono>
++#include <cmath>
++#include <cstdio>
++#include <cstring>
++#include <fstream>
++#include <iostream>
++#include <map>
++#include <numeric>
++#include <set>
++#include <sstream>
++#include <stdexcept>
++#include <vector>
++#include <unordered_map>
++
++#include <omp.h>
++#include <sched.h>
++#include <unistd.h>
++
++#include "oneapi/dnnl/dnnl.hpp"
++#include "oneapi/dnnl/dnnl_debug.h"
++
++using namespace dnnl;
++using namespace matopt_tool;
++using backend = dnnl::impl::cpu::matopt::scoped_plan_t;
++
++namespace {
++using clock_t = std::chrono::steady_clock;
++
++struct options_t {
++    std::string command;
++    std::map<std::string, std::string> values;
++    bool has(const std::string &k) const { return values.count(k) != 0; }
++    std::string get(const std::string &k, const std::string &d = "") const {
++        auto i = values.find(k);
++        return i == values.end() ? d : i->second;
++    }
++};
++
++options_t parse_args(int argc, char **argv) {
++    if (argc < 2)
++        throw std::runtime_error("expected tune, benchmark, or inspect");
++    options_t o;
++    o.command = argv[1];
++    for (int i = 2; i < argc; ++i) {
++        std::string k = argv[i];
++        if (k.compare(0, 2, "--") != 0)
++            throw std::runtime_error("unexpected argument: " + k);
++        k.erase(0, 2);
++        if (k == "compare-default") {
++            o.values[k] = "true";
++            continue;
++        }
++        if (++i == argc) throw std::runtime_error("missing value for --" + k);
++        o.values[k] = argv[i];
++    }
++    return o;
++}
++
++int64_t positive_i64(const options_t &o, const char *name) {
++    if (!o.has(name))
++        throw std::runtime_error(std::string("missing --") + name);
++    char *end = nullptr;
++    long long v = std::strtoll(o.get(name).c_str(), &end, 10);
++    if (!end || *end || v <= 0)
++        throw std::runtime_error(std::string("invalid --") + name);
++    return v;
++}
++
++std::string read_file(const std::string &path) {
++    std::ifstream f(path.c_str(), std::ios::binary);
++    if (!f) throw std::runtime_error("cannot open " + path);
++    return std::string((std::istreambuf_iterator<char>(f)), {});
++}
++std::string json_escape(const std::string &s) {
++    std::string out;
++    for (char c : s) {
++        switch (c) {
++            case '\\': out += "\\\\"; break;
++            case '"': out += "\\\""; break;
++            case '\n': out += "\\n"; break;
++            case '\r': out += "\\r"; break;
++            case '\t': out += "\\t"; break;
++            default: out += c; break;
++        }
++    }
++    return out;
++}
++void write_file(const std::string &path, const std::string &text) {
++    const std::string temporary = path + ".tmp." + std::to_string(getpid());
++    {
++        std::ofstream f(temporary.c_str(), std::ios::binary | std::ios::trunc);
++        if (!f || !(f << text))
++            throw std::runtime_error("cannot write " + temporary);
++    }
++    if (std::rename(temporary.c_str(), path.c_str()) != 0)
++        throw std::runtime_error("cannot atomically replace " + path);
++}
++void append_line(const std::string &path, const std::string &line) {
++    std::ofstream f(path.c_str(), std::ios::binary | std::ios::app);
++    if (!f || !(f << line << '\n'))
++        throw std::runtime_error("cannot append " + path);
++}
++
++void discard_truncated_history_tail(const std::string &path) {
++    std::ifstream f(path.c_str(), std::ios::binary);
++    if (!f) return;
++    std::string text((std::istreambuf_iterator<char>(f)), {});
++    if (text.empty() || text.back() == '\n') return;
++    const size_t last = text.find_last_of('\n');
++    text.resize(last == std::string::npos ? 0 : last + 1);
++    std::ofstream out(path.c_str(), std::ios::binary | std::ios::trunc);
++    if (!out || !(out << text))
++        throw std::runtime_error("cannot recover " + path);
++}
++
++bool json_number(const std::string &s, const char *name, double &out) {
++    const std::string key = std::string("\"") + name + "\"";
++    size_t p = s.find(key);
++    if (p == std::string::npos) return false;
++    p += key.size();
++    while (p < s.size() && std::isspace(static_cast<unsigned char>(s[p])))
++        ++p;
++    if (p == s.size() || s[p++] != ':') return false;
++    while (p < s.size() && std::isspace(static_cast<unsigned char>(s[p])))
++        ++p;
++    std::istringstream in(s.substr(p));
++    in >> out;
++    return !in.fail();
++}
++bool json_string(const std::string &s, const char *name, std::string &out) {
++    const std::string key = std::string("\"") + name + "\"";
++    size_t p = s.find(key);
++    if (p == std::string::npos) return false;
++    p += key.size();
++    while (p < s.size() && std::isspace(static_cast<unsigned char>(s[p])))
++        ++p;
++    if (p == s.size() || s[p++] != ':') return false;
++    while (p < s.size() && std::isspace(static_cast<unsigned char>(s[p])))
++        ++p;
++    if (p == s.size() || s[p++] != '"') return false;
++    size_t e = s.find('"', p);
++    if (e == std::string::npos) return false;
++    out = s.substr(p, e - p);
++    return true;
++}
++
++std::map<uint64_t, candidate_t> load_completed_history(
++        const std::string &path) {
++    std::map<uint64_t, candidate_t> completed;
++    std::ifstream f(path.c_str());
++    std::string line;
++    while (std::getline(f, line)) {
++        std::string state, hash_text, error;
++        if (!json_string(line, "state", state) || state != "benchmarked"
++                || !json_string(line, "candidate_hash", hash_text))
++            continue;
++        candidate_t c;
++        if (!parse_plan_json(line, c.plan, error)) continue;
++        std::istringstream hex(hash_text);
++        hex >> std::hex >> c.hash;
++        double scratch = 0, packed = 0;
++        if (!json_number(line, "one_shot_ms", c.measurement.one_shot_ms)
++                || !json_number(line, "steady_ms", c.measurement.steady_ms)
++                || !json_number(line, "throughput_gflops",
++                        c.measurement.throughput_gflops)
++                || !json_number(line, "median_ms", c.measurement.median_ms)
++                || !json_number(line, "minimum_ms", c.measurement.minimum_ms)
++                || !json_number(line, "p90_ms", c.measurement.p90_ms)
++                || !json_number(line, "packing_ms", c.measurement.packing_ms)
++                || !json_number(line, "packed_gbps", c.measurement.packed_gbps)
++                || !json_number(line, "compute_ms", c.measurement.compute_ms)
++                || !json_number(line, "scratchpad_bytes", scratch)
++                || !json_number(line, "packed_bytes", packed))
++            continue;
++        c.measurement.scratchpad_bytes = static_cast<size_t>(scratch);
++        c.measurement.packed_bytes = static_cast<size_t>(packed);
++        c.measurement.correct
++                = line.find("\"correct\":true") != std::string::npos;
++        c.measurement.stable
++                = line.find("\"stable\":true") != std::string::npos;
++        completed[c.hash] = c;
++    }
++    return completed;
++}
++
++std::vector<int> parse_cpu_mask(const std::string &text) {
++    if (text.empty())
++        throw std::runtime_error("an explicit --cpus mask is required");
++    std::set<int> cpus;
++    std::istringstream in(text);
++    std::string part;
++    while (std::getline(in, part, ',')) {
++        size_t dash = part.find('-');
++        int first = -1, last = -1;
++        try {
++            first = std::stoi(part.substr(0, dash));
++            last = dash == std::string::npos ? first
++                                             : std::stoi(part.substr(dash + 1));
++        } catch (...) { throw std::runtime_error("invalid CPU mask: " + text); }
++        if (first < 0 || last < first || last >= CPU_SETSIZE)
++            throw std::runtime_error("invalid CPU mask: " + text);
++        for (int c = first; c <= last; ++c)
++            cpus.insert(c);
++    }
++    return std::vector<int>(cpus.begin(), cpus.end());
++}
++
++void pin_and_verify(const std::string &mask, int threads) {
++    const auto cpus = parse_cpu_mask(mask);
++    if (threads > static_cast<int>(cpus.size()))
++        throw std::runtime_error(
++                "--threads exceeds the number of CPUs in --cpus");
++    cpu_set_t set;
++    CPU_ZERO(&set);
++    for (int c : cpus)
++        CPU_SET(c, &set);
++    if (sched_setaffinity(0, sizeof(set), &set) != 0)
++        throw std::runtime_error(std::string("sched_setaffinity failed: ")
++                + std::strerror(errno));
++    setenv("OMP_PROC_BIND", "close", 1);
++    setenv("OMP_PLACES", "cores", 1);
++    omp_set_dynamic(0);
++    omp_set_num_threads(threads);
++    int bad = 0, observed = 0;
++#pragma omp parallel reduction(+ : bad, observed)
++    {
++        int cpu = sched_getcpu();
++        observed += 1;
++        if (cpu < 0 || !CPU_ISSET(cpu, &set)) bad += 1;
++    }
++    if (observed != threads || bad)
++        throw std::runtime_error(
++                "OpenMP workers did not remain inside the exact CPU mask");
++}
++
++std::string first_matching_line(const char *path, const std::string &needle) {
++    std::ifstream f(path);
++    std::string line;
++    while (std::getline(f, line))
++        if (line.find(needle) != std::string::npos) return line;
++    return "unknown";
++}
++std::string machine_identity(int threads, const std::string &mask) {
++    const auto *v = dnnl::version();
++    const auto isa = dnnl_get_effective_cpu_isa();
++    std::ostringstream os;
++    os << first_matching_line("/proc/cpuinfo", "model name")
++       << ";isa=" << dnnl_cpu_isa2str(isa) << ";vector_bits="
++       << (std::string(dnnl_cpu_isa2str(isa)).find("AVX512")
++                                  != std::string::npos
++                          ? 512
++                          : 256)
++       << ";L1="
++       << first_matching_line(
++                  "/sys/devices/system/cpu/cpu0/cache/index0/size", "")
++       << ";L2="
++       << first_matching_line(
++                  "/sys/devices/system/cpu/cpu0/cache/index2/size", "")
++       << ";L3="
++       << first_matching_line(
++                  "/sys/devices/system/cpu/cpu0/cache/index3/size", "")
++       << ";threads=" << threads << ";mask=" << mask
++       << ";onednn=" << (v->hash ? v->hash : "unknown")
++       << ";compiler=" << __VERSION__
++       << ";matopt_patch=external-v2;protocol=1;schema=1"
++       << ";build_reorder=" << BUILD_REORDER;
++    return os.str();
++}
++
++unsigned parse_objectives(const std::string &s) {
++    unsigned out = 0;
++    std::istringstream in(s);
++    std::string x;
++    while (std::getline(in, x, ',')) {
++        if (x == "one-shot")
++            out |= one_shot;
++        else if (x == "steady-state")
++            out |= steady;
++        else if (x == "throughput")
++            out |= throughput;
++        else
++            throw std::runtime_error("invalid objective: " + x);
++    }
++    if (!out) throw std::runtime_error("at least one objective is required");
++    return out;
++}
++
++workload_t workload_from_options(const options_t &o) {
++    workload_t w;
++    w.M = positive_i64(o, "m");
++    w.N = positive_i64(o, "n");
++    w.K = positive_i64(o, "k");
++    w.threads = static_cast<int>(positive_i64(o, "threads"));
++    w.cpus = o.get("cpus");
++    parse_cpu_mask(w.cpus);
++    w.objectives = parse_objectives(
++            o.get("objectives", "one-shot,steady-state,throughput"));
++#if defined(DNNL_AARCH64) && DNNL_AARCH64
++    w.allow_split_k = false;
++#endif
++    return w;
++}
++
++workload_t workload_from_request(const std::string &request) {
++    workload_t w;
++    double protocol = 0, m = 0, n = 0, k = 0, threads = 0, alpha = 0, beta = 0;
++    std::string dtype, layout;
++    if (!json_number(request, "protocol_version", protocol) || protocol != 1
++            || !json_number(request, "m", m) || !json_number(request, "n", n)
++            || !json_number(request, "k", k)
++            || !json_number(request, "threads", threads)
++            || !json_string(request, "cpus", w.cpus)
++            || !json_string(request, "dtype", dtype)
++            || !json_string(request, "layout", layout)
++            || !json_number(request, "alpha", alpha)
++            || !json_number(request, "beta", beta) || dtype != "f32"
++            || layout != "dense_row_major" || alpha != 1 || beta != 0 || m <= 0
++            || n <= 0 || k <= 0 || threads <= 0) {
++        throw std::runtime_error("missing or invalid workload field");
++    }
++    w.M = static_cast<int64_t>(m);
++    w.N = static_cast<int64_t>(n);
++    w.K = static_cast<int64_t>(k);
++    w.threads = static_cast<int>(threads);
++    parse_cpu_mask(w.cpus);
++#if defined(DNNL_AARCH64) && DNNL_AARCH64
++    w.allow_split_k = false;
++#endif
++    return w;
++}
++
++struct measurement_profile_t {
++    int warmups = 3;
++    int samples = 3;
++    double minimum_sample_ms = 100;
++};
++
++measurement_profile_t profile_from_request(const std::string &request) {
++    measurement_profile_t p;
++    double value = 0;
++    if (json_number(request, "warmups", value))
++        p.warmups = static_cast<int>(value);
++    if (json_number(request, "samples", value))
++        p.samples = static_cast<int>(value);
++    if (json_number(request, "minimum_sample_ms", value))
++        p.minimum_sample_ms = value;
++    if (p.warmups < 0 || p.samples <= 0 || p.samples > 100
++            || p.minimum_sample_ms <= 0 || p.minimum_sample_ms > 60000)
++        throw std::runtime_error("invalid measurement profile");
++    return p;
++}
++
++struct data_t {
++    std::vector<float> A, B, reference;
++    memory::desc a_md, b_md, c_md;
++    data_t(const workload_t &w)
++        : A(static_cast<size_t>(w.M * w.K))
++        , B(static_cast<size_t>(w.K * w.N))
++        , reference(static_cast<size_t>(w.M * w.N))
++        , a_md({w.M, w.K}, memory::data_type::f32, memory::format_tag::ab)
++        , b_md({w.K, w.N}, memory::data_type::f32, memory::format_tag::ab)
++        , c_md({w.M, w.N}, memory::data_type::f32, memory::format_tag::ab) {
++        for (size_t i = 0; i < A.size(); ++i)
++            A[i] = static_cast<float>(static_cast<int>(i % 7) - 3);
++        for (size_t i = 0; i < B.size(); ++i)
++            B[i] = static_cast<float>(static_cast<int>(i % 5) - 2);
++        // Deterministic non-integral samples exercise FP paths without making
++        // the exact-integer bulk validation sensitive to reduction order.
++        for (size_t i = 0; i < A.size(); i += 4093)
++            A[i] += 0.125f;
++        for (size_t i = 0; i < B.size(); i += 4099)
++            B[i] -= 0.25f;
++    }
++};
++
++struct case_t {
++    matmul::primitive_desc pd;
++    matmul primitive;
++    memory a, b_plain, b_exec, c, scratchpad;
++    stream strm;
++    bool persistent;
++    finalized_plan_t finalized;
++    case_t(engine &eng, data_t &d, const plan_t *plan)
++        : a(d.a_md, eng, d.A.data())
++        , b_plain(d.b_md, eng, d.B.data())
++        , strm(eng)
++        , persistent(plan
++                  && (plan->pack_b == pack_b_t::persistent_n32
++                          || plan->pack_b == pack_b_t::persistent_n64)) {
++        dnnl::impl::cpu::matopt::clear_capture();
++        backend scope(plan);
++        const auto requested_b = persistent
++                ? memory::desc(d.b_md.get_dims(), memory::data_type::f32,
++                          memory::format_tag::any)
++                : d.b_md;
++        primitive_attr attr;
++        attr.set_scratchpad_mode(scratchpad_mode::user);
++        pd = matmul::primitive_desc(eng, d.a_md, requested_b, d.c_md, attr);
++        primitive = matmul(pd);
++        b_exec = persistent ? memory(pd.weights_desc(), eng) : b_plain;
++        c = memory(d.c_md, eng);
++        if (pd.scratchpad_desc().get_size() != 0)
++            scratchpad = memory(pd.scratchpad_desc(), eng);
++        if (persistent) {
++            reorder(b_plain, b_exec).execute(strm, b_plain, b_exec);
++            strm.wait();
++        }
++        const bool captured = dnnl::impl::cpu::matopt::get_capture(finalized);
++        if (plan && (!captured || finalized.realized_bd_block == 0)) {
++            std::string why = dnnl::impl::cpu::matopt::get_error();
++            throw std::runtime_error(why.empty() ? "plan did not instantiate "
++                                                   "the BRGEMM MatMul backend"
++                                                 : why);
++        }
++        if (plan
++                && ((plan->bd_block
++                            && finalized.realized_bd_block != plan->bd_block)
++                        || (plan->ld_block2
++                                && finalized.realized_ld_block2
++                                        != plan->ld_block2)))
++            throw std::runtime_error(
++                    "backend did not realize the requested microtile");
++        finalized.scratchpad_bytes = pd.scratchpad_desc().get_size();
++        if (plan
++                && finalized.scratchpad_bytes
++                        > static_cast<size_t>(omp_get_max_threads()) * 64ULL
++                                * 1024 * 1024)
++            throw std::runtime_error(
++                    "realized scratchpad exceeds 64 MiB per thread");
++    }
++    void reorder_b() {
++        if (persistent) {
++            reorder(b_plain, b_exec).execute(strm, b_plain, b_exec);
++            strm.wait();
++        }
++    }
++    void execute() {
++        std::unordered_map<int, memory> args {{DNNL_ARG_SRC, a},
++                {DNNL_ARG_WEIGHTS, b_exec}, {DNNL_ARG_DST, c}};
++        if (pd.scratchpad_desc().get_size() != 0)
++            args.emplace(DNNL_ARG_SCRATCHPAD, scratchpad);
++        primitive.execute(strm, args);
++        strm.wait();
++    }
++};
++
++double elapsed_ms(const clock_t::time_point &a, const clock_t::time_point &b) {
++    return std::chrono::duration<double, std::milli>(b - a).count();
++}
++
++std::vector<double> sample(
++        case_t &c, int samples, double min_total_ms, bool include_reorder) {
++    std::vector<double> values;
++    values.reserve(samples);
++    for (int s = 0; s < samples; ++s) {
++        int iters = 1;
++        double duration = 0;
++        do {
++            auto begin = clock_t::now();
++            for (int i = 0; i < iters; ++i) {
++                if (include_reorder) c.reorder_b();
++                c.execute();
++            }
++            duration = elapsed_ms(begin, clock_t::now());
++            if (duration < min_total_ms)
++                iters = std::max(iters + 1,
++                        static_cast<int>(std::ceil(iters * min_total_ms
++                                / std::max(duration, 0.001))));
++        } while (duration < min_total_ms);
++        values.push_back(duration / iters);
++    }
++    std::sort(values.begin(), values.end());
++    return values;
++}
++
++measurement_t benchmark_case(case_t &c, data_t &d, const workload_t &w,
++        int samples, double min_ms, bool validate, int warmups = 3) {
++    measurement_t m;
++    for (int i = 0; i < warmups; ++i)
++        c.execute();
++    if (validate) {
++        const float *got = static_cast<const float *>(c.c.get_data_handle());
++        size_t bad = 0;
++        for (size_t i = 0; i < d.reference.size(); ++i) {
++            const float tol = 2e-4f * std::max(1.f, std::fabs(d.reference[i]));
++            if (std::fabs(got[i] - d.reference[i]) > tol) {
++                ++bad;
++                if (bad == 8) break;
++            }
++        }
++        m.correct = bad == 0;
++        if (!m.correct) return m;
++    } else
++        m.correct = true;
++    if (c.persistent) {
++        auto begin = clock_t::now();
++        for (int i = 0; i < 3; ++i)
++            c.reorder_b();
++        m.packing_ms = elapsed_ms(begin, clock_t::now()) / 3.0;
++        m.packed_bytes = c.pd.weights_desc().get_size();
++        m.packed_gbps = m.packed_bytes / (m.packing_ms * 1e6);
++    }
++    auto steady_samples = sample(c, samples, min_ms, false);
++    auto one_samples
++            = c.persistent ? sample(c, samples, min_ms, true) : steady_samples;
++    const size_t p90 = std::min(one_samples.size() - 1,
++            static_cast<size_t>(std::ceil(0.9 * one_samples.size()) - 1));
++    m.minimum_ms = one_samples.front();
++    m.median_ms = one_samples[one_samples.size() / 2];
++    m.p90_ms = one_samples[p90];
++    m.one_shot_ms = m.median_ms;
++    m.steady_ms = steady_samples[steady_samples.size() / 2];
++    m.compute_ms = m.steady_ms;
++    m.throughput_gflops = 2.0 * w.M * w.N * w.K / (m.steady_ms * 1e6);
++    m.scratchpad_bytes = c.finalized.scratchpad_bytes;
++    m.stable
++            = m.median_ms > 0 && (m.p90_ms - m.median_ms) / m.median_ms <= 0.05;
++    return m;
++}
++
++void make_reference(engine &eng, data_t &d) {
++    case_t baseline(eng, d, nullptr);
++    baseline.execute();
++    std::memcpy(d.reference.data(), baseline.c.get_data_handle(),
++            d.reference.size() * sizeof(float));
++}
++
++plan_t replay_plan(const finalized_plan_t &f) {
++    plan_t p = f;
++    p.pack_a = f.use_buffer_a ? pack_a_t::per_call_padded : pack_a_t::direct;
++    if (f.blocked_B)
++        p.pack_b = f.N_blk == 32 ? pack_b_t::persistent_n32
++                                 : pack_b_t::persistent_n64;
++    else if (f.use_buffer_b)
++        p.pack_b = f.N_blk == 32 ? pack_b_t::per_call_n32
++                                 : pack_b_t::per_call_n64;
++    else
++        p.pack_b = pack_b_t::direct;
++    p.K_chunk_size = std::max(1, p.K_chunk_size);
++    p.bd_block = 0;
++    p.ld_block2 = 0;
++    p.loop_order = loop_order_t::default_order;
++    return p;
++}
++
++std::string history_record(const std::string &key, const char *state,
++        const candidate_t &c, const std::string &reason = "") {
++    std::ostringstream os;
++    os << "{\"resume_key\":\"" << key << "\",\"state\":\"" << state
++       << "\",\"candidate_hash\":\"" << std::hex << c.hash << std::dec
++       << "\",\"plan\":" << plan_json(c.plan);
++    if (!reason.empty()) os << ",\"reason\":\"" << json_escape(reason) << "\"";
++    if (std::string(state) == "benchmarked")
++        os << ",\"measurement\":" << measurement_json(c.measurement);
++    os << "}";
++    return os.str();
++}
++
++void inspect_command(const options_t &o) {
++    if (!o.has("plan")) throw std::runtime_error("inspect requires --plan");
++    plan_t p;
++    std::string error;
++    if (!parse_plan_json(read_file(o.get("plan")), p, error))
++        throw std::runtime_error(error);
++    std::cout << plan_json(p) << '\n';
++    std::cout << "estimated_scratchpad_per_thread=" << estimate_scratchpad(p)
++              << " bytes\n";
++}
++
++void benchmark_command(const options_t &o) {
++    workload_t w = workload_from_options(o);
++    pin_and_verify(w.cpus, w.threads);
++    dnnl::set_primitive_cache_capacity(0);
++    plan_t p;
++    std::string error;
++    if (!o.has("plan") || !parse_plan_json(read_file(o.get("plan")), p, error))
++        throw std::runtime_error(
++                o.has("plan") ? error : "benchmark requires --plan");
++    if (!(error = validate_plan(w, p)).empty()) throw std::runtime_error(error);
++    engine eng(engine::kind::cpu, 0);
++    data_t d(w);
++    make_reference(eng, d);
++    case_t tuned(eng, d, &p);
++    auto result = benchmark_case(tuned, d, w, 15, 1000, true);
++    std::cout << "{\"finalized\":" << finalized_json(tuned.finalized)
++              << ",\"measurement\":" << measurement_json(result) << "}" << '\n';
++    if (o.has("compare-default")) {
++        case_t def(eng, d, nullptr);
++        auto base = benchmark_case(def, d, w, 15, 1000, true);
++        std::cout << "{\"default\":" << measurement_json(base) << "}" << '\n';
++    }
++}
++
++void tune_command(const options_t &o) {
++    workload_t w = workload_from_options(o);
++    if (!o.has("history") || !o.has("output"))
++        throw std::runtime_error("tune requires --history and --output");
++    pin_and_verify(w.cpus, w.threads);
++    dnnl::set_primitive_cache_capacity(0);
++    const std::string identity = machine_identity(w.threads, w.cpus);
++    const std::string key = workload_key(w, identity);
++    size_t old_records = 0;
++    std::string error;
++    if (!validate_history(o.get("history"), key, old_records, error))
++        throw std::runtime_error(error);
++    discard_truncated_history_tail(o.get("history"));
++    const auto completed = load_completed_history(o.get("history"));
++    engine eng(engine::kind::cpu, 0);
++    data_t d(w);
++
++    // Capture and replay the current oneDNN heuristic before generating any
++    // mutations. AArch64 temporarily forces the effective tuning baseline to
++    // nthr_k=1, without changing oneDNN's ordinary null-plan behavior.
++    case_t captured_default(eng, d, nullptr);
++    plan_t baseline_plan = replay_plan(captured_default.finalized);
++    if (!w.allow_split_k) baseline_plan.nthr_k = 1;
++    case_t replayed(eng, d, &baseline_plan);
++    const auto &a = captured_default.finalized;
++    const auto &b = replayed.finalized;
++    if (a.M_blk != b.M_blk || a.N_blk != b.N_blk || a.K_blk != b.K_blk
++            || a.M_chunk_size != b.M_chunk_size
++            || a.N_chunk_size != b.N_chunk_size
++            || a.brgemm_batch_size != b.brgemm_batch_size
++            || (w.allow_split_k && a.nthr_k != b.nthr_k)
++            || b.nthr_k != baseline_plan.nthr_k || a.M_tail != b.M_tail
++            || a.N_tail != b.N_tail || a.K_tail != b.K_tail)
++        throw std::runtime_error(
++                "captured default configuration did not replay identically");
++    if (w.allow_split_k) {
++        make_reference(eng, d);
++    } else {
++        replayed.execute();
++        std::memcpy(d.reference.data(), replayed.c.get_data_handle(),
++                d.reference.size() * sizeof(float));
++    }
++
++    std::vector<candidate_t> all;
++    std::vector<unsigned> active_objectives;
++    for (unsigned obj : {one_shot, steady, throughput})
++        if (w.objectives & obj) active_objectives.push_back(obj);
++    candidate_t baseline;
++    baseline.plan = baseline_plan;
++    baseline.hash = stable_hash(plan_json(baseline.plan));
++    auto previous = completed.find(baseline.hash);
++    baseline.measurement = previous == completed.end()
++            ? benchmark_case(replayed, d, w, 3, 100, true)
++            : previous->second.measurement;
++    all.push_back(baseline);
++    if (previous == completed.end())
++        append_line(o.get("history"),
++                history_record(key, "benchmarked", all.back()));
++
++    finalized_plan_t candidate_baseline = captured_default.finalized;
++    static_cast<plan_t &>(candidate_baseline) = baseline_plan;
++    auto macro = generate_candidates(w, candidate_baseline);
++    // Deterministic hash order removes systematic thermal/order bias while
++    // remaining exactly reproducible for the resume key.
++    std::sort(macro.begin(), macro.end(),
++            [&](const candidate_t &x, const candidate_t &y) {
++        return (x.hash ^ stable_hash(key)) < (y.hash ^ stable_hash(key));
++    });
++    for (auto &c : macro) {
++        if (c.hash == baseline.hash) continue;
++        auto done = completed.find(c.hash);
++        if (done != completed.end()) {
++            c.measurement = done->second.measurement;
++            all.push_back(c);
++            continue;
++        }
++        append_line(
++                o.get("history"), history_record(key, "started", c, "macro"));
++        try {
++            case_t run(eng, d, &c.plan);
++            c.measurement = benchmark_case(run, d, w, 3, 100, true);
++            if (!c.measurement.correct)
++                append_line(
++                        o.get("history"), history_record(key, "incorrect", c));
++            else
++                append_line(o.get("history"),
++                        history_record(key, "benchmarked", c));
++            all.push_back(c);
++        } catch (const std::exception &e) {
++            append_line(o.get("history"),
++                    history_record(key, "rejected", c, e.what()));
++        }
++    }
++
++    // Top three per objective seed the micro search.
++    std::set<uint64_t> seeds;
++    for (unsigned obj : active_objectives) {
++        std::vector<size_t> order(all.size());
++        std::iota(order.begin(), order.end(), 0);
++        std::sort(order.begin(), order.end(), [&](size_t x, size_t y) {
++            if (all[x].measurement.correct != all[y].measurement.correct)
++                return all[x].measurement.correct;
++            if (obj == throughput)
++                return all[x].measurement.throughput_gflops
++                        > all[y].measurement.throughput_gflops;
++            return (obj == one_shot ? all[x].measurement.one_shot_ms
++                                    : all[x].measurement.steady_ms)
++                    < (obj == one_shot ? all[y].measurement.one_shot_ms
++                                       : all[y].measurement.steady_ms);
++        });
++        size_t kept = 0;
++        for (size_t i : order) {
++            if (!all[i].measurement.correct) continue;
++            seeds.insert(all[i].hash);
++            if (++kept == 3) break;
++        }
++    }
++    const std::vector<int> bds {0, 4, 5, 6, 7};
++    const std::vector<int> lds {0, 2, 3, 4};
++    std::vector<candidate_t> micro;
++    std::set<uint64_t> micro_seen;
++    for (const auto &seed : all)
++        if (seeds.count(seed.hash))
++            for (int bd : bds)
++                for (int ld : lds)
++                    for (loop_order_t loop : {loop_order_t::default_order,
++                                 loop_order_t::one_load}) {
++                        candidate_t c;
++                        c.plan = seed.plan;
++                        c.plan.bd_block = bd;
++                        c.plan.ld_block2 = ld;
++                        c.plan.loop_order = loop;
++                        c.hash = stable_hash(plan_json(c.plan));
++                        if (c.hash == seed.hash
++                                || !micro_seen.insert(c.hash).second)
++                            continue;
++                        auto done = completed.find(c.hash);
++                        if (done != completed.end()) {
++                            c.measurement = done->second.measurement;
++                            micro.push_back(c);
++                            continue;
++                        }
++                        c.rejection = validate_plan(w, c.plan);
++                        if (!c.rejection.empty()) {
++                            append_line(o.get("history"),
++                                    history_record(
++                                            key, "rejected", c, c.rejection));
++                            continue;
++                        }
++                        append_line(o.get("history"),
++                                history_record(key, "started", c, "micro"));
++                        try {
++                            case_t run(eng, d, &c.plan);
++                            c.measurement
++                                    = benchmark_case(run, d, w, 5, 200, true);
++                            append_line(o.get("history"),
++                                    history_record(key,
++                                            c.measurement.correct
++                                                    ? "benchmarked"
++                                                    : "incorrect",
++                                            c));
++                            if (c.measurement.correct) micro.push_back(c);
++                        } catch (const std::exception &e) {
++                            append_line(o.get("history"),
++                                    history_record(
++                                            key, "rejected", c, e.what()));
++                        }
++                    }
++    all.insert(all.end(), micro.begin(), micro.end());
++
++    // Finalize the best observed candidate for each objective. Unstable
++    // finalists are rerun once and cannot win if still above 5% spread.
++    std::set<size_t> finalist_indices;
++    finalist_indices.insert(0);
++    for (unsigned obj : active_objectives) {
++        size_t idx = choose_candidate(all, obj, 0, 0.0);
++        finalist_indices.insert(idx);
++    }
++    for (size_t idx : finalist_indices) {
++        append_line(o.get("history"),
++                history_record(key, "started", all[idx], "finalist"));
++        case_t run(eng, d, &all[idx].plan);
++        all[idx].measurement = benchmark_case(run, d, w, 15, 1000, true);
++        if (!all[idx].measurement.stable)
++            all[idx].measurement = benchmark_case(run, d, w, 15, 1000, true);
++        append_line(
++                o.get("history"), history_record(key, "benchmarked", all[idx]));
++    }
++    // Baseline noise is its observed high-tail spread.
++    const double noise = all[0].measurement.median_ms > 0
++            ? std::max(0.0,
++                      (all[0].measurement.p90_ms - all[0].measurement.median_ms)
++                              / all[0].measurement.median_ms)
++            : 0.0;
++    const size_t one_idx = (w.objectives & one_shot)
++            ? choose_candidate(all, one_shot, 0, noise)
++            : 0;
++    const size_t steady_idx = (w.objectives & steady)
++            ? choose_candidate(all, steady, 0, noise)
++            : 0;
++    const size_t throughput_idx = (w.objectives & throughput)
++            ? choose_candidate(all, throughput, 0, noise)
++            : 0;
++    const auto pareto = pareto_indices(all);
++    std::ostringstream output;
++    output << "{\"schema_version\":1,\"resume_key\":\"" << key
++           << "\",\"identity\":\"" << json_escape(identity)
++           << "\",\"selected\":{";
++    bool first_selected = true;
++    auto emit_selected = [&](const char *name, size_t idx) {
++        if (!first_selected) output << ',';
++        first_selected = false;
++        output << '\"' << name << "\":" << plan_json(all[idx].plan);
++    };
++    if (w.objectives & one_shot) emit_selected("one-shot", one_idx);
++    if (w.objectives & steady) emit_selected("steady-state", steady_idx);
++    if (w.objectives & throughput) emit_selected("throughput", throughput_idx);
++    output << "},\"pareto\":[";
++    for (size_t i = 0; i < pareto.size(); ++i) {
++        if (i) output << ',';
++        output << "{\"plan\":" << plan_json(all[pareto[i]].plan)
++               << ",\"measurement\":"
++               << measurement_json(all[pareto[i]].measurement) << "}";
++    }
++    output << "]}\n";
++    write_file(o.get("output"), output.str());
++    std::cout << "wrote " << o.get("output") << " with " << pareto.size()
++              << " Pareto plans (history records before run: " << old_records
++              << ")\n";
++}
++
++std::string rejection_code(const std::string &detail) {
++    if (detail.find("split-K") != std::string::npos)
++        return "split_k_unsupported";
++    if (detail.find("thread-count divisor") != std::string::npos)
++        return "invalid_thread_partition";
++    if (detail.find("K granularity") != std::string::npos)
++        return "invalid_k_granularity";
++    if (detail.find("packing") != std::string::npos
++            || detail.find("format") != std::string::npos
++            || detail.find("blocked weights") != std::string::npos)
++        return "packing_layout_mismatch";
++    if (detail.find("K chunks") != std::string::npos)
++        return "insufficient_k_chunks";
++    if (detail.find("scratchpad") != std::string::npos)
++        return "scratchpad_limit_exceeded";
++    if (detail.find("microtile") != std::string::npos
++            || detail.find("register-pressure") != std::string::npos)
++        return "invalid_microtile";
++    return "invalid_plan";
++}
++
++std::string request_id(const std::string &request) {
++    std::string id;
++    if (!json_string(request, "request_id", id) || id.empty())
++        throw std::runtime_error("missing request_id");
++    return id;
++}
++
++std::string fingerprint_for(const workload_t &w, std::string &identity) {
++    identity = machine_identity(w.threads, w.cpus);
++    return workload_key(w, identity);
++}
++
++void check_expected_fingerprint(
++        const std::string &request, const std::string &actual) {
++    std::string expected;
++    if (json_string(request, "expected_fingerprint", expected)
++            && !expected.empty() && expected != actual)
++        throw std::runtime_error("fingerprint mismatch");
++}
++
++void prepare_runner(const workload_t &w) {
++    pin_and_verify(w.cpus, w.threads);
++    dnnl::set_primitive_cache_capacity(0);
++}
++
++void capabilities_command(const options_t &o) {
++    if (!o.has("request"))
++        throw std::runtime_error("capabilities requires --request");
++    const std::string request = read_file(o.get("request"));
++    const std::string id = request_id(request);
++    const workload_t w = workload_from_request(request);
++    prepare_runner(w);
++    std::string identity;
++    const std::string fingerprint = fingerprint_for(w, identity);
++    check_expected_fingerprint(request, fingerprint);
++    const std::string isa = dnnl_cpu_isa2str(dnnl_get_effective_cpu_isa());
++    std::cout << "{\"protocol_version\":1,\"request_id\":\"" << json_escape(id)
++              << "\",\"status\":\"capabilities\"" << ",\"fingerprint\":\""
++              << fingerprint << "\"" << ",\"identity\":\""
++              << json_escape(identity) << "\"" << ",\"effective_isa\":\""
++              << json_escape(isa) << "\"" << ",\"plan_schema_version\":1"
++              << ",\"workload_domain\":{\"dtype\":[\"f32\"],"
++                 "\"layout\":[\"dense_row_major\"],\"alpha\":[1],"
++                 "\"beta\":[0]}"
++              << ",\"constraints\":{\"allow_split_k\":"
++              << (w.allow_split_k ? "true" : "false")
++              << ",\"scratchpad_per_thread_bytes\":67108864}"
++              << ",\"domains\":{\"pack_a\":[\"direct\","
++                 "\"per_call_padded\"],\"pack_b\":[\"direct\","
++                 "\"per_call_n32\",\"per_call_n64\","
++                 "\"persistent_n32\",\"persistent_n64\"],"
++                 "\"bd_block\":[0,4,5,6,7],"
++                 "\"ld_block2\":[0,2,3,4],"
++                 "\"loop_order\":[\"default\",\"one-load\"]}}\n";
++}
++
++struct baseline_t {
++    finalized_plan_t captured;
++    plan_t effective;
++    finalized_plan_t finalized;
++    measurement_t measurement;
++};
++
++baseline_t run_baseline(const workload_t &w, const measurement_profile_t &p) {
++    engine eng(engine::kind::cpu, 0);
++    data_t data(w);
++    case_t captured(eng, data, nullptr);
++    plan_t effective = replay_plan(captured.finalized);
++    if (!w.allow_split_k) effective.nthr_k = 1;
++    case_t replayed(eng, data, &effective);
++    const auto &a = captured.finalized;
++    const auto &b = replayed.finalized;
++    if (a.M_blk != b.M_blk || a.N_blk != b.N_blk || a.K_blk != b.K_blk
++            || a.M_chunk_size != b.M_chunk_size
++            || a.N_chunk_size != b.N_chunk_size
++            || a.brgemm_batch_size != b.brgemm_batch_size
++            || (w.allow_split_k && a.nthr_k != b.nthr_k)
++            || b.nthr_k != effective.nthr_k || a.M_tail != b.M_tail
++            || a.N_tail != b.N_tail || a.K_tail != b.K_tail)
++        throw std::runtime_error(
++                "captured default configuration did not replay identically");
++    if (w.allow_split_k) {
++        make_reference(eng, data);
++    } else {
++        replayed.execute();
++        std::memcpy(data.reference.data(), replayed.c.get_data_handle(),
++                data.reference.size() * sizeof(float));
++    }
++    baseline_t out;
++    out.captured = captured.finalized;
++    out.effective = effective;
++    out.finalized = replayed.finalized;
++    out.measurement = benchmark_case(
++            replayed, data, w, p.samples, p.minimum_sample_ms, true, p.warmups);
++    return out;
++}
++
++void baseline_command(const options_t &o) {
++    if (!o.has("request"))
++        throw std::runtime_error("baseline requires --request");
++    const std::string request = read_file(o.get("request"));
++    const std::string id = request_id(request);
++    const workload_t w = workload_from_request(request);
++    const measurement_profile_t profile = profile_from_request(request);
++    prepare_runner(w);
++    std::string identity;
++    const std::string fingerprint = fingerprint_for(w, identity);
++    check_expected_fingerprint(request, fingerprint);
++    const baseline_t result = run_baseline(w, profile);
++    std::cout << "{\"protocol_version\":1,\"request_id\":\"" << json_escape(id)
++              << "\",\"status\":\"benchmarked\"" << ",\"fingerprint\":\""
++              << fingerprint << "\""
++              << ",\"captured_default\":" << finalized_json(result.captured)
++              << ",\"effective_plan\":" << plan_json(result.effective)
++              << ",\"finalized\":" << finalized_json(result.finalized)
++              << ",\"measurement\":" << measurement_json(result.measurement)
++              << "}\n";
++}
++
++void evaluate_command(const options_t &o, bool inspect_only) {
++    if (!o.has("request"))
++        throw std::runtime_error("evaluate requires --request");
++    const std::string request = read_file(o.get("request"));
++    const std::string id = request_id(request);
++    const workload_t w = workload_from_request(request);
++    const measurement_profile_t profile = profile_from_request(request);
++    prepare_runner(w);
++    std::string identity;
++    const std::string fingerprint = fingerprint_for(w, identity);
++    check_expected_fingerprint(request, fingerprint);
++    plan_t plan;
++    std::string detail;
++    if (!parse_plan_json(request, plan, detail))
++        throw std::runtime_error(detail);
++    detail = validate_plan(w, plan);
++    try {
++        if (!detail.empty()) throw std::runtime_error(detail);
++        engine eng(engine::kind::cpu, 0);
++        data_t data(w);
++        if (!inspect_only) {
++            if (w.allow_split_k) {
++                make_reference(eng, data);
++            } else {
++                case_t captured(eng, data, nullptr);
++                plan_t safe = replay_plan(captured.finalized);
++                safe.nthr_k = 1;
++                case_t reference(eng, data, &safe);
++                reference.execute();
++                std::memcpy(data.reference.data(),
++                        reference.c.get_data_handle(),
++                        data.reference.size() * sizeof(float));
++            }
++        }
++        case_t evaluated(eng, data, &plan);
++        if (inspect_only) {
++            std::cout << "{\"protocol_version\":1,\"request_id\":\""
++                      << json_escape(id) << "\",\"status\":\"accepted\""
++                      << ",\"fingerprint\":\"" << fingerprint << "\""
++                      << ",\"finalized\":"
++                      << finalized_json(evaluated.finalized) << "}\n";
++            return;
++        }
++        measurement_t measured
++                = benchmark_case(evaluated, data, w, profile.samples,
++                        profile.minimum_sample_ms, true, profile.warmups);
++        std::cout << "{\"protocol_version\":1,\"request_id\":\""
++                  << json_escape(id) << "\",\"status\":\""
++                  << (measured.correct ? "benchmarked" : "incorrect") << "\""
++                  << ",\"fingerprint\":\"" << fingerprint << "\""
++                  << ",\"finalized\":" << finalized_json(evaluated.finalized)
++                  << ",\"measurement\":" << measurement_json(measured) << "}\n";
++    } catch (const std::exception &e) {
++        detail = e.what();
++        std::cout << "{\"protocol_version\":1,\"request_id\":\""
++                  << json_escape(id) << "\",\"status\":\"rejected\""
++                  << ",\"fingerprint\":\"" << fingerprint << "\""
++                  << ",\"reason_code\":\"" << rejection_code(detail)
++                  << "\",\"detail\":\"" << json_escape(detail) << "\"}\n";
++    }
++}
++
++void usage() {
++    std::cerr << "usage:\n"
++              << "  matopt tune --m M --n N --k K --threads T --cpus MASK "
++                 "--objectives LIST --history H --output O\n"
++              << "  matopt benchmark --plan P --m M --n N --k K --threads T "
++                 "--cpus MASK [--compare-default]\n"
++              << "  matopt inspect --plan P\n";
++}
++} // namespace
++
++int main(int argc, char **argv) {
++    try {
++        options_t o = parse_args(argc, argv);
++        if (o.command == "tune")
++            tune_command(o);
++        else if (o.command == "benchmark")
++            benchmark_command(o);
++        else if (o.command == "inspect") {
++            if (o.has("request"))
++                evaluate_command(o, true);
++            else
++                inspect_command(o);
++        } else if (o.command == "capabilities")
++            capabilities_command(o);
++        else if (o.command == "baseline")
++            baseline_command(o);
++        else if (o.command == "evaluate")
++            evaluate_command(o, false);
++        else
++            throw std::runtime_error("unknown command: " + o.command);
++        return 0;
++    } catch (const std::exception &e) {
++        std::cerr << "matopt: " << e.what() << '\n';
++        usage();
++        return 2;
++    }
++}
+diff --git a/tools/matopt/matopt_core.cpp b/tools/matopt/matopt_core.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..9a1b2e13f21b5077b1b7ef3ea5250542c8a6d81b
+--- /dev/null
++++ b/tools/matopt/matopt_core.cpp
+@@ -0,0 +1,593 @@
++/*******************************************************************************
++* Copyright 2026
++* Licensed under the Apache License, Version 2.0 (the "License");
++******************************************************************************/
++#include "matopt_core.hpp"
++
++#include <algorithm>
++#include <cctype>
++#include <cmath>
++#include <cstring>
++#include <fstream>
++#include <iomanip>
++#include <set>
++#include <sstream>
++
++namespace matopt_tool {
++namespace {
++class json_cursor_t {
++public:
++    explicit json_cursor_t(const std::string &s) : s_(s) {}
++    bool parse() {
++        ws();
++        if (!value()) return false;
++        ws();
++        return p_ == s_.size();
++    }
++
++private:
++    void ws() {
++        while (p_ < s_.size()
++                && (s_[p_] == ' ' || s_[p_] == '\t' || s_[p_] == '\r'
++                        || s_[p_] == '\n'))
++            ++p_;
++    }
++    bool literal(const char *x) {
++        const size_t n = std::strlen(x);
++        if (s_.compare(p_, n, x) != 0) return false;
++        p_ += n;
++        return true;
++    }
++    bool string() {
++        if (p_ == s_.size() || s_[p_++] != '"') return false;
++        while (p_ < s_.size()) {
++            const unsigned char c = s_[p_++];
++            if (c == '"') return true;
++            if (c < 0x20) return false;
++            if (c == '\\') {
++                if (p_ == s_.size()) return false;
++                const char e = s_[p_++];
++                if (e == 'u') {
++                    for (int i = 0; i < 4; ++i) {
++                        if (p_ == s_.size()
++                                || !std::isxdigit(
++                                        static_cast<unsigned char>(s_[p_++])))
++                            return false;
++                    }
++                } else if (std::string("\"\\/bfnrt").find(e)
++                        == std::string::npos)
++                    return false;
++            }
++        }
++        return false;
++    }
++    bool number() {
++        const size_t begin = p_;
++        if (p_ < s_.size() && s_[p_] == '-') ++p_;
++        if (p_ == s_.size()) return false;
++        if (s_[p_] == '0')
++            ++p_;
++        else {
++            if (!std::isdigit(static_cast<unsigned char>(s_[p_]))) return false;
++            while (p_ < s_.size()
++                    && std::isdigit(static_cast<unsigned char>(s_[p_])))
++                ++p_;
++        }
++        if (p_ < s_.size() && s_[p_] == '.') {
++            ++p_;
++            if (p_ == s_.size()
++                    || !std::isdigit(static_cast<unsigned char>(s_[p_])))
++                return false;
++            while (p_ < s_.size()
++                    && std::isdigit(static_cast<unsigned char>(s_[p_])))
++                ++p_;
++        }
++        if (p_ < s_.size() && (s_[p_] == 'e' || s_[p_] == 'E')) {
++            ++p_;
++            if (p_ < s_.size() && (s_[p_] == '+' || s_[p_] == '-')) ++p_;
++            if (p_ == s_.size()
++                    || !std::isdigit(static_cast<unsigned char>(s_[p_])))
++                return false;
++            while (p_ < s_.size()
++                    && std::isdigit(static_cast<unsigned char>(s_[p_])))
++                ++p_;
++        }
++        return p_ > begin;
++    }
++    bool array() {
++        ++p_;
++        ws();
++        if (p_ < s_.size() && s_[p_] == ']') {
++            ++p_;
++            return true;
++        }
++        while (value()) {
++            ws();
++            if (p_ < s_.size() && s_[p_] == ']') {
++                ++p_;
++                return true;
++            }
++            if (p_ == s_.size() || s_[p_++] != ',') return false;
++            ws();
++        }
++        return false;
++    }
++    bool object() {
++        ++p_;
++        ws();
++        if (p_ < s_.size() && s_[p_] == '}') {
++            ++p_;
++            return true;
++        }
++        while (string()) {
++            ws();
++            if (p_ == s_.size() || s_[p_++] != ':') return false;
++            ws();
++            if (!value()) return false;
++            ws();
++            if (p_ < s_.size() && s_[p_] == '}') {
++                ++p_;
++                return true;
++            }
++            if (p_ == s_.size() || s_[p_++] != ',') return false;
++            ws();
++        }
++        return false;
++    }
++    bool value() {
++        ws();
++        if (p_ == s_.size()) return false;
++        if (s_[p_] == '{') return object();
++        if (s_[p_] == '[') return array();
++        if (s_[p_] == '"') return string();
++        if (s_[p_] == '-' || std::isdigit(static_cast<unsigned char>(s_[p_])))
++            return number();
++        return literal("true") || literal("false") || literal("null");
++    }
++    const std::string &s_;
++    size_t p_ = 0;
++};
++
++bool valid_json(const std::string &s) {
++    return json_cursor_t(s).parse();
++}
++
++template <typename T>
++bool field_number(const std::string &s, const char *name, T &out) {
++    const std::string key = std::string("\"") + name + "\"";
++    size_t p = s.find(key);
++    if (p == std::string::npos) return false;
++    p += key.size();
++    while (p < s.size() && std::isspace(static_cast<unsigned char>(s[p])))
++        ++p;
++    if (p == s.size() || s[p++] != ':') return false;
++    while (p < s.size() && std::isspace(static_cast<unsigned char>(s[p])))
++        ++p;
++    std::istringstream is(s.substr(p));
++    is >> out;
++    return !is.fail();
++}
++
++bool field_string(const std::string &s, const char *name, std::string &out) {
++    const std::string key = std::string("\"") + name + "\"";
++    size_t p = s.find(key);
++    if (p == std::string::npos) return false;
++    p += key.size();
++    while (p < s.size() && std::isspace(static_cast<unsigned char>(s[p])))
++        ++p;
++    if (p == s.size() || s[p++] != ':') return false;
++    while (p < s.size() && std::isspace(static_cast<unsigned char>(s[p])))
++        ++p;
++    if (p == s.size() || s[p++] != '"') return false;
++    size_t e = s.find('"', p);
++    if (e == std::string::npos) return false;
++    out = s.substr(p, e - p);
++    return true;
++}
++
++template <typename T>
++void unique_push(std::vector<T> &v, T x) {
++    if (std::find(v.begin(), v.end(), x) == v.end()) v.push_back(x);
++}
++
++double tail_penalty(int64_t dim, int block) {
++    if (block <= 0 || dim <= block || dim % block == 0) return 0;
++    return 1.0 - static_cast<double>(dim % block) / block;
++}
++} // namespace
++
++uint64_t stable_hash(const std::string &s) {
++    uint64_t h = UINT64_C(1469598103934665603);
++    for (unsigned char c : s) {
++        h ^= c;
++        h *= UINT64_C(1099511628211);
++    }
++    return h;
++}
++
++std::string pack_a_name(pack_a_t v) {
++    return v == pack_a_t::direct ? "direct" : "per_call_padded";
++}
++std::string pack_b_name(pack_b_t v) {
++    switch (v) {
++        case pack_b_t::direct: return "direct";
++        case pack_b_t::per_call_n32: return "per_call_n32";
++        case pack_b_t::per_call_n64: return "per_call_n64";
++        case pack_b_t::persistent_n32: return "persistent_n32";
++        case pack_b_t::persistent_n64: return "persistent_n64";
++    }
++    return "invalid";
++}
++std::string loop_order_name(loop_order_t v) {
++    return v == loop_order_t::one_load ? "one-load" : "default";
++}
++
++std::string workload_key(const workload_t &w, const std::string &identity) {
++    std::ostringstream os;
++    os << "schema=" << w.version << ";M=" << w.M << ";N=" << w.N << ";K=" << w.K
++       << ";threads=" << w.threads << ";cpus=" << w.cpus
++       << ";alpha=1;beta=0;identity=" << identity;
++    std::ostringstream hex;
++    hex << std::hex << stable_hash(os.str());
++    return hex.str();
++}
++
++std::string plan_json(const plan_t &p) {
++    std::ostringstream os;
++    os << "{\"schema_version\":" << p.version << ",\"M_blk\":" << p.M_blk
++       << ",\"N_blk\":" << p.N_blk << ",\"K_blk\":" << p.K_blk
++       << ",\"M_chunk_size\":" << p.M_chunk_size
++       << ",\"N_chunk_size\":" << p.N_chunk_size
++       << ",\"K_chunk_size\":" << p.K_chunk_size
++       << ",\"brgemm_batch_size\":" << p.brgemm_batch_size
++       << ",\"nthr_k\":" << p.nthr_k << ",\"pack_a\":\""
++       << pack_a_name(p.pack_a) << "\",\"pack_b\":\"" << pack_b_name(p.pack_b)
++       << "\",\"bd_block\":" << p.bd_block << ",\"ld_block2\":" << p.ld_block2
++       << ",\"loop_order\":\"" << loop_order_name(p.loop_order) << "\"}";
++    return os.str();
++}
++
++bool parse_plan_json(const std::string &s, plan_t &p, std::string &error) {
++    unsigned version = 0;
++    std::string a, b, loop;
++    if (!valid_json(s)) {
++        error = "malformed JSON";
++        return false;
++    }
++    if (!field_number(s, "schema_version", version)
++            || !field_number(s, "M_blk", p.M_blk)
++            || !field_number(s, "N_blk", p.N_blk)
++            || !field_number(s, "K_blk", p.K_blk)
++            || !field_number(s, "M_chunk_size", p.M_chunk_size)
++            || !field_number(s, "N_chunk_size", p.N_chunk_size)
++            || !field_number(s, "K_chunk_size", p.K_chunk_size)
++            || !field_number(s, "brgemm_batch_size", p.brgemm_batch_size)
++            || !field_number(s, "nthr_k", p.nthr_k)
++            || !field_number(s, "bd_block", p.bd_block)
++            || !field_number(s, "ld_block2", p.ld_block2)
++            || !field_string(s, "pack_a", a) || !field_string(s, "pack_b", b)
++            || !field_string(s, "loop_order", loop)) {
++        error = "missing or malformed plan field";
++        return false;
++    }
++    p.version = version;
++    if (version != dnnl::impl::cpu::matopt::schema_version) {
++        error = "unsupported schema version";
++        return false;
++    }
++    if (a == "direct")
++        p.pack_a = pack_a_t::direct;
++    else if (a == "per_call_padded")
++        p.pack_a = pack_a_t::per_call_padded;
++    else {
++        error = "invalid pack_a";
++        return false;
++    }
++    if (b == "direct")
++        p.pack_b = pack_b_t::direct;
++    else if (b == "per_call_n32")
++        p.pack_b = pack_b_t::per_call_n32;
++    else if (b == "per_call_n64")
++        p.pack_b = pack_b_t::per_call_n64;
++    else if (b == "persistent_n32")
++        p.pack_b = pack_b_t::persistent_n32;
++    else if (b == "persistent_n64")
++        p.pack_b = pack_b_t::persistent_n64;
++    else {
++        error = "invalid pack_b";
++        return false;
++    }
++    if (loop == "default")
++        p.loop_order = loop_order_t::default_order;
++    else if (loop == "one-load")
++        p.loop_order = loop_order_t::one_load;
++    else {
++        error = "invalid loop_order";
++        return false;
++    }
++    return true;
++}
++
++std::string finalized_json(const finalized_plan_t &p) {
++    std::ostringstream os;
++    os << "{\"plan\":" << plan_json(p) << ",\"M\":" << p.M << ",\"N\":" << p.N
++       << ",\"K\":" << p.K << ",\"M_tail\":" << p.M_tail
++       << ",\"N_tail\":" << p.N_tail << ",\"K_tail\":" << p.K_tail
++       << ",\"LDA\":" << p.LDA << ",\"LDB\":" << p.LDB << ",\"LDC\":" << p.LDC
++       << ",\"M_chunks\":" << p.M_chunks << ",\"N_chunks\":" << p.N_chunks
++       << ",\"K_chunks\":" << p.K_chunks
++       << ",\"realized_bd_block\":" << p.realized_bd_block
++       << ",\"realized_ld_block2\":" << p.realized_ld_block2
++       << ",\"use_buffer_a\":" << (p.use_buffer_a ? "true" : "false")
++       << ",\"use_buffer_b\":" << (p.use_buffer_b ? "true" : "false")
++       << ",\"blocked_B\":" << (p.blocked_B ? "true" : "false")
++       << ",\"scratchpad_bytes\":" << p.scratchpad_bytes << "}";
++    return os.str();
++}
++
++std::string measurement_json(const measurement_t &m) {
++    std::ostringstream os;
++    os << std::setprecision(9) << "{\"one_shot_ms\":" << m.one_shot_ms
++       << ",\"steady_ms\":" << m.steady_ms
++       << ",\"throughput_gflops\":" << m.throughput_gflops
++       << ",\"median_ms\":" << m.median_ms << ",\"minimum_ms\":" << m.minimum_ms
++       << ",\"p90_ms\":" << m.p90_ms << ",\"packing_ms\":" << m.packing_ms
++       << ",\"packed_bytes\":" << m.packed_bytes
++       << ",\"packed_gbps\":" << m.packed_gbps
++       << ",\"compute_ms\":" << m.compute_ms
++       << ",\"scratchpad_bytes\":" << m.scratchpad_bytes
++       << ",\"correct\":" << (m.correct ? "true" : "false")
++       << ",\"stable\":" << (m.stable ? "true" : "false") << "}";
++    return os.str();
++}
++
++size_t estimate_scratchpad(const plan_t &p) {
++    size_t bytes = 0;
++    if (p.pack_a == pack_a_t::per_call_padded)
++        bytes += static_cast<size_t>(p.M_blk) * p.K_blk * 4;
++    if (p.pack_b == pack_b_t::per_call_n32
++            || p.pack_b == pack_b_t::per_call_n64)
++        bytes += static_cast<size_t>(p.K_blk) * p.N_blk * p.brgemm_batch_size
++                * 4;
++    if (p.nthr_k > 1) bytes += static_cast<size_t>(p.M_blk) * p.N_blk * 4;
++    return bytes;
++}
++
++std::string validate_plan(
++        const workload_t &w, const plan_t &p, size_t scratch_limit) {
++    if (w.version != 1 || w.M <= 0 || w.N <= 0 || w.K <= 0 || w.threads <= 0)
++        return "invalid workload";
++    if (w.alpha != 1.f || w.beta != 0.f) return "MVP requires alpha=1,beta=0";
++    if (p.M_blk <= 0 || p.N_blk <= 0 || p.K_blk <= 0 || p.M_chunk_size <= 0
++            || p.N_chunk_size <= 0 || p.brgemm_batch_size <= 0 || p.nthr_k <= 0)
++        return "non-positive blocking field";
++    if (p.M_blk > w.M || p.N_blk > w.N || p.K_blk > w.K)
++        return "block exceeds workload dimension";
++    if (!w.allow_split_k && p.nthr_k != 1)
++        return "split-K tuning is disabled on AArch64";
++    if (w.threads % p.nthr_k) return "nthr_k is not a thread-count divisor";
++    const int64_t k_blocks = (w.K + p.K_blk - 1) / p.K_blk;
++    if (p.brgemm_batch_size > k_blocks)
++        return "BRGEMM batch size exceeds the number of K blocks";
++    const int64_t k_chunks
++            = (k_blocks + p.brgemm_batch_size - 1) / p.brgemm_batch_size;
++    if (p.nthr_k > k_chunks) return "nthr_k exceeds the number of K chunks";
++    const bool n32 = p.pack_b == pack_b_t::per_call_n32
++            || p.pack_b == pack_b_t::persistent_n32;
++    const bool n64 = p.pack_b == pack_b_t::per_call_n64
++            || p.pack_b == pack_b_t::persistent_n64;
++    if ((n32 && p.N_blk != 32) || (n64 && p.N_blk != 64))
++        return "B format is incompatible with N_blk";
++    if (p.bd_block < 0 || p.bd_block > 7 || p.ld_block2 < 0 || p.ld_block2 > 4)
++        return "invalid microtile hint";
++    if (p.bd_block && p.ld_block2 && p.bd_block * p.ld_block2 > 28)
++        return "microtile exceeds register-pressure budget";
++    if (estimate_scratchpad(p) > scratch_limit)
++        return "estimated scratchpad exceeds 64 MiB per thread";
++    return "";
++}
++
++std::vector<candidate_t> generate_candidates(
++        const workload_t &w, const finalized_plan_t &b, size_t cap) {
++    std::vector<int> ms {b.M_blk, 64, 96, 128, 160, 192, 224, 256};
++    std::vector<int> ns {b.N_blk, 32, 64};
++    std::vector<int> ks {b.K_blk, 256, 512, 1024};
++    std::vector<int> ncs {b.N_chunk_size, 1, 2, 4, 8};
++    std::vector<int> batches {b.brgemm_batch_size, 1, 2, 4};
++    std::vector<int> nthrks = w.allow_split_k
++            ? std::vector<int> {b.nthr_k, 1, 2, 4}
++            : std::vector<int> {1};
++    std::vector<pack_a_t> as {pack_a_t::direct, pack_a_t::per_call_padded};
++    std::vector<pack_b_t> bs {pack_b_t::direct, pack_b_t::per_call_n32,
++            pack_b_t::per_call_n64, pack_b_t::persistent_n32,
++            pack_b_t::persistent_n64};
++    std::vector<candidate_t> out;
++    std::set<uint64_t> seen;
++    for (int m : ms)
++        for (int n : ns)
++            for (int k : ks)
++                for (int nc : ncs)
++                    for (int batch : batches)
++                        for (int nk : nthrks)
++                            for (pack_a_t a : as)
++                                for (pack_b_t pb : bs) {
++                                    plan_t p = b;
++                                    p.M_blk = m;
++                                    p.N_blk = n;
++                                    p.K_blk = k;
++                                    p.N_chunk_size = nc;
++                                    p.brgemm_batch_size = batch;
++                                    p.nthr_k = nk;
++                                    p.pack_a = a;
++                                    p.pack_b = pb;
++                                    p.bd_block = 0;
++                                    p.ld_block2 = 0;
++                                    p.loop_order = loop_order_t::default_order;
++                                    const uint64_t h
++                                            = stable_hash(plan_json(p));
++                                    if (!seen.insert(h).second) continue;
++                                    candidate_t c;
++                                    c.plan = p;
++                                    c.hash = h;
++                                    c.rejection = validate_plan(w, p);
++                                    const double distance = (m != b.M_blk)
++                                            + (n != b.N_blk) + (k != b.K_blk)
++                                            + (nc != b.N_chunk_size)
++                                            + (batch != b.brgemm_batch_size)
++                                            + (nk != b.nthr_k) + (a != b.pack_a)
++                                            + (pb != b.pack_b);
++                                    c.rank = distance * 1000.0
++                                            + estimate_scratchpad(p) / 65536.0
++                                            + 100.0
++                                                    * (tail_penalty(w.M, m)
++                                                            + tail_penalty(
++                                                                    w.N, n)
++                                                            + tail_penalty(
++                                                                    w.K, k))
++                                            + static_cast<double>(h & 0xffff)
++                                                    / 65536.0;
++                                    // Preserve baseline and every one-field mutation. More distant
++                                    // Cartesian points must provide useful parallel work and avoid gross
++                                    // padding waste before entering the capped ranking set.
++                                    if (c.rejection.empty() && distance > 1.0) {
++                                        const int64_t m_units
++                                                = (w.M + p.M_blk * p.M_chunk_size
++                                                          - 1)
++                                                / (p.M_blk * p.M_chunk_size);
++                                        const int64_t n_units
++                                                = (w.N + p.N_blk * p.N_chunk_size
++                                                          - 1)
++                                                / (p.N_blk * p.N_chunk_size);
++                                        const int64_t parallel_work
++                                                = m_units * n_units;
++                                        const int64_t k_blocks
++                                                = (w.K + p.K_blk - 1) / p.K_blk;
++                                        const int64_t k_chunks
++                                                = (k_blocks
++                                                          + p.brgemm_batch_size
++                                                          - 1)
++                                                / p.brgemm_batch_size;
++                                        if (parallel_work
++                                                        * std::min<int64_t>(
++                                                                p.nthr_k,
++                                                                k_chunks)
++                                                        * 2
++                                                < w.threads)
++                                            c.rejection
++                                                    = "insufficient parallel "
++                                                      "work";
++                                        const double severe_tail
++                                                = tail_penalty(w.M, p.M_blk)
++                                                + tail_penalty(w.N, p.N_blk)
++                                                + tail_penalty(w.K, p.K_blk);
++                                        if (c.rejection.empty()
++                                                && severe_tail > 2.25)
++                                            c.rejection
++                                                    = "severe aggregate tail "
++                                                      "waste";
++                                    }
++                                    if (c.rejection.empty()) out.push_back(c);
++                                }
++    std::sort(out.begin(), out.end(),
++            [](const candidate_t &a, const candidate_t &b) {
++        if (a.rank != b.rank) return a.rank < b.rank;
++        return a.hash < b.hash;
++    });
++    if (out.size() > cap) out.resize(cap);
++    return out;
++}
++
++std::vector<size_t> pareto_indices(const std::vector<candidate_t> &cs) {
++    std::vector<size_t> result;
++    for (size_t i = 0; i < cs.size(); ++i) {
++        const auto &a = cs[i].measurement;
++        if (!a.correct || !a.stable) continue;
++        bool dominated = false;
++        for (size_t j = 0; j < cs.size() && !dominated; ++j) {
++            if (i == j) continue;
++            const auto &b = cs[j].measurement;
++            if (!b.correct || !b.stable) continue;
++            const bool no_worse = b.one_shot_ms <= a.one_shot_ms
++                    && b.steady_ms <= a.steady_ms
++                    && b.throughput_gflops >= a.throughput_gflops
++                    && b.scratchpad_bytes <= a.scratchpad_bytes;
++            const bool better = b.one_shot_ms < a.one_shot_ms
++                    || b.steady_ms < a.steady_ms
++                    || b.throughput_gflops > a.throughput_gflops
++                    || b.scratchpad_bytes < a.scratchpad_bytes;
++            dominated = no_worse && better;
++        }
++        if (!dominated) result.push_back(i);
++    }
++    return result;
++}
++
++size_t choose_candidate(const std::vector<candidate_t> &cs, unsigned objective,
++        size_t baseline, double noise) {
++    size_t best = baseline;
++    for (size_t i = 0; i < cs.size(); ++i) {
++        if (!cs[i].measurement.correct || !cs[i].measurement.stable) continue;
++        if (objective == one_shot
++                && cs[i].measurement.one_shot_ms
++                        < cs[best].measurement.one_shot_ms)
++            best = i;
++        if (objective == steady
++                && cs[i].measurement.steady_ms < cs[best].measurement.steady_ms)
++            best = i;
++        if (objective == throughput
++                && cs[i].measurement.throughput_gflops
++                        > cs[best].measurement.throughput_gflops)
++            best = i;
++    }
++    double gain = 0;
++    if (objective == throughput)
++        gain = cs[best].measurement.throughput_gflops
++                        / cs[baseline].measurement.throughput_gflops
++                - 1.0;
++    else {
++        const double bv = objective == one_shot
++                ? cs[baseline].measurement.one_shot_ms
++                : cs[baseline].measurement.steady_ms;
++        const double cv = objective == one_shot
++                ? cs[best].measurement.one_shot_ms
++                : cs[best].measurement.steady_ms;
++        gain = 1.0 - cv / bv;
++    }
++    return gain > std::max(0.01, noise) ? best : baseline;
++}
++
++bool validate_history(const std::string &path, const std::string &key,
++        size_t &records, std::string &error) {
++    records = 0;
++    std::ifstream f(path.c_str(), std::ios::binary);
++    if (!f) return true;
++    std::string all((std::istreambuf_iterator<char>(f)), {});
++    size_t pos = 0;
++    while (pos < all.size()) {
++        size_t end = all.find('\n', pos);
++        const bool final_unterminated = end == std::string::npos;
++        if (final_unterminated) end = all.size();
++        const std::string line = all.substr(pos, end - pos);
++        if (!line.empty()) {
++            const bool object = valid_json(line);
++            std::string found;
++            const bool has_key = field_string(line, "resume_key", found);
++            if (!object || !has_key) {
++                if (final_unterminated) return true;
++                error = "malformed complete JSONL record "
++                        + std::to_string(records + 1);
++                return false;
++            }
++            if (found != key) {
++                error = "history resume key mismatch";
++                return false;
++            }
++            ++records;
++        }
++        if (final_unterminated) break;
++        pos = end + 1;
++    }
++    return true;
++}
++
++} // namespace matopt_tool
+diff --git a/tools/matopt/matopt_core.hpp b/tools/matopt/matopt_core.hpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..b80e92b1217d57832c2da181386f61e9ba3d09ba
+--- /dev/null
++++ b/tools/matopt/matopt_core.hpp
+@@ -0,0 +1,84 @@
++/*******************************************************************************
++* Copyright 2026
++* Licensed under the Apache License, Version 2.0 (the "License");
++******************************************************************************/
++#ifndef TOOLS_MATOPT_CORE_HPP
++#define TOOLS_MATOPT_CORE_HPP
++
++#include <cstdint>
++#include <string>
++#include <vector>
++
++#include "cpu/matmul/matopt_backend.hpp"
++
++namespace matopt_tool {
++
++using dnnl::impl::cpu::matopt::finalized_plan_t;
++using dnnl::impl::cpu::matopt::loop_order_t;
++using dnnl::impl::cpu::matopt::pack_a_t;
++using dnnl::impl::cpu::matopt::pack_b_t;
++using dnnl::impl::cpu::matopt::plan_t;
++
++enum objective_bits { one_shot = 1, steady = 2, throughput = 4 };
++
++struct workload_t {
++    uint32_t version = dnnl::impl::cpu::matopt::schema_version;
++    int64_t M = 0, N = 0, K = 0;
++    int threads = 0;
++    std::string cpus;
++    unsigned objectives = one_shot | steady | throughput;
++    float alpha = 1.f;
++    float beta = 0.f;
++    bool allow_split_k = true;
++};
++
++struct measurement_t {
++    double one_shot_ms = 0;
++    double steady_ms = 0;
++    double throughput_gflops = 0;
++    double median_ms = 0;
++    double minimum_ms = 0;
++    double p90_ms = 0;
++    double packing_ms = 0;
++    double packed_gbps = 0;
++    double compute_ms = 0;
++    size_t packed_bytes = 0;
++    size_t scratchpad_bytes = 0;
++    bool correct = false;
++    bool stable = true;
++};
++
++struct candidate_t {
++    plan_t plan;
++    uint64_t hash = 0;
++    double rank = 0;
++    std::string rejection;
++    measurement_t measurement;
++};
++
++uint64_t stable_hash(const std::string &s);
++std::string workload_key(const workload_t &w, const std::string &identity);
++std::string plan_json(const plan_t &p);
++bool parse_plan_json(const std::string &json, plan_t &p, std::string &error);
++std::string finalized_json(const finalized_plan_t &p);
++std::string measurement_json(const measurement_t &m);
++std::string pack_a_name(pack_a_t v);
++std::string pack_b_name(pack_b_t v);
++std::string loop_order_name(loop_order_t v);
++
++std::vector<candidate_t> generate_candidates(const workload_t &w,
++        const finalized_plan_t &baseline, size_t cap = 256);
++std::string validate_plan(const workload_t &w, const plan_t &p,
++        size_t scratch_limit = 64ULL * 1024 * 1024);
++size_t estimate_scratchpad(const plan_t &p);
++std::vector<size_t> pareto_indices(const std::vector<candidate_t> &candidates);
++size_t choose_candidate(const std::vector<candidate_t> &candidates,
++        unsigned objective, size_t baseline_index, double baseline_noise);
++
++// Reads append-only JSONL. Only an unterminated malformed final record is
++// recoverable. Every complete record must contain the exact resume key.
++bool validate_history(const std::string &path, const std::string &resume_key,
++        size_t &records, std::string &error);
++
++} // namespace matopt_tool
++#endif
+diff --git a/tools/matopt/test_backend.cpp b/tools/matopt/test_backend.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..57add3418281b7546de4c46625ba9b7ebfa18f35
+--- /dev/null
++++ b/tools/matopt/test_backend.cpp
+@@ -0,0 +1,141 @@
++/*******************************************************************************
++* Copyright 2026
++* Licensed under the Apache License, Version 2.0 (the "License");
++******************************************************************************/
++#include "matopt_core.hpp"
++
++#include <cmath>
++#include <cstring>
++#include <iostream>
++#include <vector>
++#include <unordered_map>
++
++#include "oneapi/dnnl/dnnl.hpp"
++
++using namespace dnnl;
++using namespace matopt_tool;
++using dnnl::impl::cpu::matopt::clear_capture;
++using dnnl::impl::cpu::matopt::get_capture;
++using dnnl::impl::cpu::matopt::scoped_plan_t;
++
++namespace {
++constexpr int64_t M = 130, N = 70, K = 66;
++
++struct fixture_t {
++    engine eng {engine::kind::cpu, 0};
++    stream strm {eng};
++    memory::desc a_md {{M, K}, memory::data_type::f32, memory::format_tag::ab};
++    memory::desc b_md {{K, N}, memory::data_type::f32, memory::format_tag::ab};
++    memory::desc c_md {{M, N}, memory::data_type::f32, memory::format_tag::ab};
++    std::vector<float> A = std::vector<float>(M * K);
++    std::vector<float> B = std::vector<float>(K * N);
++    std::vector<float> reference = std::vector<float>(M * N);
++
++    fixture_t() {
++        for (size_t i = 0; i < A.size(); ++i)
++            A[i] = static_cast<int>(i % 7) - 3;
++        for (size_t i = 0; i < B.size(); ++i)
++            B[i] = static_cast<int>(i % 5) - 2;
++        A[17] += 0.125f;
++        B[23] -= 0.25f;
++        memory a(a_md, eng, A.data()), b(b_md, eng, B.data()), c(c_md, eng);
++        matmul::primitive_desc pd(eng, a_md, b_md, c_md);
++        matmul(pd).execute(strm,
++                {{DNNL_ARG_SRC, a}, {DNNL_ARG_WEIGHTS, b}, {DNNL_ARG_DST, c}});
++        strm.wait();
++        std::memcpy(
++                reference.data(), c.get_data_handle(), reference.size() * 4);
++    }
++
++    bool run(const plan_t &plan, finalized_plan_t &finalized) {
++        const bool persistent = plan.pack_b == pack_b_t::persistent_n32
++                || plan.pack_b == pack_b_t::persistent_n64;
++        clear_capture();
++        scoped_plan_t scope(&plan);
++        auto requested_b = persistent
++                ? memory::desc({K, N}, memory::data_type::f32,
++                          memory::format_tag::any)
++                : b_md;
++        matmul::primitive_desc pd(eng, a_md, requested_b, c_md);
++        matmul primitive(pd);
++        if (!get_capture(finalized) || finalized.realized_bd_block == 0)
++            return false;
++        memory a(a_md, eng, A.data()), plain_b(b_md, eng, B.data());
++        memory exec_b = persistent ? memory(pd.weights_desc(), eng) : plain_b;
++        if (persistent) {
++            reorder(plain_b, exec_b).execute(strm, plain_b, exec_b);
++            strm.wait();
++        }
++        memory c(c_md, eng);
++        primitive.execute(strm,
++                {{DNNL_ARG_SRC, a}, {DNNL_ARG_WEIGHTS, exec_b},
++                        {DNNL_ARG_DST, c}});
++        strm.wait();
++        const float *got = static_cast<const float *>(c.get_data_handle());
++        for (size_t i = 0; i < reference.size(); ++i) {
++            const float tol = 2e-4f * std::max(1.f, std::fabs(reference[i]));
++            if (std::fabs(got[i] - reference[i]) > tol) return false;
++        }
++        return true;
++    }
++};
++
++plan_t plan(pack_a_t a, pack_b_t b) {
++    plan_t p;
++    p.M_blk = 64;
++    p.N_blk = (b == pack_b_t::per_call_n32 || b == pack_b_t::persistent_n32)
++            ? 32
++            : 64;
++    p.K_blk = 64;
++    p.M_chunk_size = p.N_chunk_size = p.K_chunk_size = 1;
++    p.brgemm_batch_size = 1;
++    p.nthr_k = 1;
++    p.pack_a = a;
++    p.pack_b = b;
++    return p;
++}
++} // namespace
++
++int main() {
++    dnnl::set_primitive_cache_capacity(0);
++    fixture_t f;
++    const std::vector<std::pair<pack_a_t, pack_b_t>> policies {
++            {pack_a_t::direct, pack_b_t::direct},
++            {pack_a_t::per_call_padded, pack_b_t::direct},
++            {pack_a_t::direct, pack_b_t::per_call_n32},
++            {pack_a_t::direct, pack_b_t::per_call_n64},
++            {pack_a_t::direct, pack_b_t::persistent_n32},
++            {pack_a_t::direct, pack_b_t::persistent_n64}};
++    for (const auto &policy : policies) {
++        finalized_plan_t out;
++        const auto p = plan(policy.first, policy.second);
++        try {
++            if (!f.run(p, out)) {
++                std::cerr << "packing policy failed: "
++                          << pack_a_name(policy.first) << '/'
++                          << pack_b_name(policy.second) << '\n';
++                return 1;
++            }
++        } catch (const std::exception &e) {
++            std::cerr << "packing policy threw: " << pack_a_name(policy.first)
++                      << '/' << pack_b_name(policy.second) << ": " << e.what()
++                      << '\n';
++            return 1;
++        }
++        if (out.M_tail != 2 || out.N_tail != N % p.N_blk || out.K_tail != 2) {
++            std::cerr << "combined tail finalization mismatch\n";
++            return 1;
++        }
++    }
++    auto hinted = plan(pack_a_t::direct, pack_b_t::direct);
++    hinted.bd_block = 4;
++    hinted.ld_block2 = 2;
++    finalized_plan_t realized;
++    if (!f.run(hinted, realized) || realized.realized_bd_block != 4
++            || realized.realized_ld_block2 != 2) {
++        std::cerr << "microtile hint was not realized\n";
++        return 1;
++    }
++    std::cout << "matopt backend tests passed\n";
++    return 0;
++}
+diff --git a/tools/matopt/test_matopt.cpp b/tools/matopt/test_matopt.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..70b5dba06450f28e66690d982f0aa931eb8a4453
+--- /dev/null
++++ b/tools/matopt/test_matopt.cpp
+@@ -0,0 +1,153 @@
++/*******************************************************************************
++* Copyright 2026
++* Licensed under the Apache License, Version 2.0 (the "License");
++******************************************************************************/
++#include "matopt_core.hpp"
++
++#include "cpu/matmul/matopt_copy_a.hpp"
++
++#include <cstdio>
++#include <fstream>
++#include <iostream>
++
++using namespace matopt_tool;
++namespace {
++int failures = 0;
++#define CHECK(x) \
++    do { \
++        if (!(x)) { \
++            std::cerr << __FILE__ << ':' << __LINE__ \
++                      << ": CHECK(" #x ") failed\n"; \
++            ++failures; \
++        } \
++    } while (0)
++
++plan_t sample_plan() {
++    plan_t p;
++    p.M_blk = 128;
++    p.N_blk = 64;
++    p.K_blk = 512;
++    p.M_chunk_size = 1;
++    p.N_chunk_size = 2;
++    p.K_chunk_size = 1;
++    p.brgemm_batch_size = 2;
++    p.nthr_k = 1;
++    p.pack_a = pack_a_t::per_call_padded;
++    p.pack_b = pack_b_t::per_call_n64;
++    p.bd_block = 6;
++    p.ld_block2 = 4;
++    p.loop_order = loop_order_t::one_load;
++    return p;
++}
++} // namespace
++
++int main() {
++    plan_t p = sample_plan(), q;
++    std::string error;
++    CHECK(parse_plan_json(plan_json(p), q, error));
++    CHECK(plan_json(p) == plan_json(q));
++    CHECK(stable_hash(plan_json(p)) == stable_hash(plan_json(q)));
++
++    const float copy_src[] {1, 2, 3, 99, 4, 5, 6, 99};
++    float copy_dst[10];
++    for (float &v : copy_dst)
++        v = -1;
++    dnnl::impl::cpu::matopt::copy_a_f32(
++            copy_src, copy_dst, 2, 3, 4 * sizeof(float), 5);
++    CHECK(copy_dst[0] == 1 && copy_dst[1] == 2 && copy_dst[2] == 3);
++    CHECK(copy_dst[3] == 0 && copy_dst[4] == 0);
++    CHECK(copy_dst[5] == 4 && copy_dst[6] == 5 && copy_dst[7] == 6);
++    CHECK(copy_dst[8] == 0 && copy_dst[9] == 0);
++
++    workload_t w;
++    w.M = 4096;
++    w.N = 4096;
++    w.K = 4096;
++    w.threads = 8;
++    CHECK(validate_plan(w, p).empty());
++    q = p;
++    q.N_blk = 32;
++    CHECK(validate_plan(w, q) == "B format is incompatible with N_blk");
++    q = p;
++    q.nthr_k = 3;
++    CHECK(validate_plan(w, q) == "nthr_k is not a thread-count divisor");
++    w.allow_split_k = false;
++    q.nthr_k = 2;
++    CHECK(validate_plan(w, q) == "split-K tuning is disabled on AArch64");
++    w.allow_split_k = true;
++    q = p;
++    q.nthr_k = 4;
++    q.brgemm_batch_size = 4;
++    CHECK(validate_plan(w, q) == "nthr_k exceeds the number of K chunks");
++    q = p;
++    q.brgemm_batch_size = 9;
++    CHECK(validate_plan(w, q)
++            == "BRGEMM batch size exceeds the number of K blocks");
++    q = p;
++    q.bd_block = 7;
++    q.ld_block2 = 4;
++    CHECK(validate_plan(w, q).empty());
++    q.bd_block = 8;
++    CHECK(validate_plan(w, q) == "invalid microtile hint");
++
++    finalized_plan_t base;
++    static_cast<plan_t &>(base) = p;
++    base.M_blk = 128;
++    base.N_blk = 64;
++    base.K_blk = 512;
++    auto candidates = generate_candidates(w, base);
++    CHECK(!candidates.empty());
++    CHECK(candidates.size() <= 256);
++    for (const auto &c : candidates)
++        CHECK(validate_plan(w, c.plan).empty());
++
++    w.allow_split_k = false;
++    candidates = generate_candidates(w, base);
++    CHECK(!candidates.empty());
++    for (const auto &c : candidates)
++        CHECK(c.plan.nthr_k == 1);
++
++    std::vector<candidate_t> cs(3);
++    for (auto &c : cs) {
++        c.measurement.correct = true;
++        c.measurement.stable = true;
++    }
++    cs[0].measurement.one_shot_ms = 10;
++    cs[0].measurement.steady_ms = 9;
++    cs[0].measurement.throughput_gflops = 100;
++    cs[0].measurement.scratchpad_bytes = 10;
++    cs[1].measurement.one_shot_ms = 9;
++    cs[1].measurement.steady_ms = 8;
++    cs[1].measurement.throughput_gflops = 110;
++    cs[1].measurement.scratchpad_bytes = 9;
++    cs[2].measurement.one_shot_ms = 8;
++    cs[2].measurement.steady_ms = 10;
++    cs[2].measurement.throughput_gflops = 90;
++    cs[2].measurement.scratchpad_bytes = 8;
++    auto pareto = pareto_indices(cs);
++    CHECK(pareto.size() == 2);
++    CHECK(choose_candidate(cs, one_shot, 0, 0.0) == 2);
++    cs[1].measurement.one_shot_ms = 9.95;
++    CHECK(choose_candidate(cs, one_shot, 0, 0.02) == 2);
++
++    const std::string path = "/tmp/matopt_history_test.jsonl";
++    {
++        std::ofstream f(path.c_str());
++        f << "{\"resume_key\":\"abc\",\"state\":\"ok\"}\n";
++        f << "{truncated";
++    }
++    size_t records = 0;
++    CHECK(validate_history(path, "abc", records, error));
++    CHECK(records == 1);
++    {
++        std::ofstream f(path.c_str(), std::ios::app);
++        f << "}\n";
++    }
++    error.clear();
++    CHECK(!validate_history(path, "abc", records, error));
++    std::remove(path.c_str());
++
++    if (failures) return 1;
++    std::cout << "matopt unit tests passed\n";
++    return 0;
++}
+diff --git a/tools/matopt/testdata/evaluate_avx2.json b/tools/matopt/testdata/evaluate_avx2.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..2fa692c9c49a811aaed810447e3e0bf785382c91
+--- /dev/null
++++ b/tools/matopt/testdata/evaluate_avx2.json
+@@ -0,0 +1,39 @@
++{
++  "protocol_version": 1,
++  "request_id": "native-avx2-smoke",
++  "expected_fingerprint": "",
++  "workload": {
++    "m": 64,
++    "n": 64,
++    "k": 64,
++    "dtype": "f32",
++    "layout": "dense_row_major",
++    "alpha": 1,
++    "beta": 0,
++    "threads": 1,
++    "cpus": "0"
++  },
++  "plan": {
++    "schema_version": 1,
++    "M_blk": 64,
++    "N_blk": 64,
++    "K_blk": 64,
++    "M_chunk_size": 1,
++    "N_chunk_size": 1,
++    "K_chunk_size": 1,
++    "brgemm_batch_size": 1,
++    "nthr_k": 1,
++    "pack_a": "direct",
++    "pack_b": "direct",
++    "bd_block": 0,
++    "ld_block2": 0,
++    "loop_order": "default"
++  },
++  "measurement": {
++    "profile": "macro",
++    "warmups": 1,
++    "samples": 1,
++    "minimum_sample_ms": 10,
++    "seed": 19260817
++  }
++}

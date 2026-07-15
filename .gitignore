@@ -1,0 +1,14 @@
+# The upstream checkout is used only to develop and verify the distributable patch.
+/oneDNN/
+
+# Python environments and generated files.
+.venv/
+matopt-tuner/.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Tuning output.
+*.jsonl
+plans.json
+
