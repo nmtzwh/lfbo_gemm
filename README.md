@@ -65,3 +65,11 @@ MATOPT_RUNNER=/path/to/matopt-runner MATOPT_CPU=0 \
   uv run python -m unittest discover -s tests -v
 ```
 
+Plot an LFBO optimization trajectory from its append-only history with:
+
+```bash
+cd matopt-tuner
+uv sync --extra lfbo --extra visualization
+uv run matopt-tuner visualize \
+  --history run.jsonl --output trajectory.png --metric one_shot
+```

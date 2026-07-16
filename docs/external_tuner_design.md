@@ -372,6 +372,30 @@ uv sync --extra lfbo
 uv run matopt-tuner tune --search lfbo ...
 ```
 
+### Trajectory visualization
+
+The standalone tuner renders an existing JSONL history without loading oneDNN
+or changing the history. `matopt-tuner visualize` orders correct benchmarked
+records by timestamp and plots:
+
+- one scatter point per measured plan on the evaluation timeline;
+- scatter color as the recorded LFBO generation;
+- the captured oneDNN baseline as a distinct star; and
+- a stepwise Pareto envelope containing the cumulative minimum latency at the
+  end of each generation.
+
+The plotted metric can be one-shot, steady-state, or median latency. Rejected,
+incorrect, and failed candidates have no meaningful latency and are omitted
+from the scatter, while remaining available to LFBO through the unchanged
+JSONL history. A truncated final JSONL record is ignored for visualization;
+complete malformed records and mixed machine fingerprints are rejected.
+
+```text
+uv sync --extra lfbo --extra visualization
+uv run matopt-tuner visualize \
+  --history run.jsonl --output trajectory.png --metric one_shot
+```
+
 ## Measurement and concurrency rules
 
 Only one evaluation may run on a CPU mask at a time. Parallel proposal

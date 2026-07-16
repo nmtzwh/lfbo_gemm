@@ -33,3 +33,18 @@ trains a Random Forest classifier, and filters multi-field neighbors around the
 best search copies. Rejections and process failures are retained as negative
 training examples. See `docs/external_tuner_design.md` in the parent workspace
 for the full workflow and algorithm rationale.
+
+## Optimization trajectory
+
+Render benchmarked latencies in evaluation order, colored by LFBO generation,
+with the generation-level best-so-far Pareto envelope overlaid:
+
+```bash
+UV_CACHE_DIR=/tmp/uv-cache uv sync --extra lfbo --extra visualization
+
+UV_CACHE_DIR=/tmp/uv-cache uv run matopt-tuner visualize \
+  --history run.jsonl --output trajectory.png --metric one_shot
+```
+
+`--metric` accepts `one_shot`, `steady`, or `median`. The visualizer reads the
+append-only history directly and tolerates an incomplete final JSONL record.

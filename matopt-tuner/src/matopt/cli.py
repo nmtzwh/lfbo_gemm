@@ -8,6 +8,7 @@ from .protocol import MeasurementProfile, Workload
 from .runner import MatOptRunner
 from .search.lfbo import LFBOConfig
 from .session import TuningSession
+from .visualization import METRICS, plot_trajectory
 
 
 def parser() -> argparse.ArgumentParser:
@@ -43,11 +44,27 @@ def parser() -> argparse.ArgumentParser:
     tune.add_argument("--lfbo-patience", type=int, default=2)
     tune.add_argument("--lfbo-trees", type=int, default=100)
     tune.add_argument("--lfbo-model-jobs", type=int, default=1)
+    visualize = sub.add_parser("visualize")
+    visualize.add_argument("--history", required=True)
+    visualize.add_argument("--output", required=True)
+    visualize.add_argument("--metric", choices=tuple(METRICS), default="one_shot")
+    visualize.add_argument("--title")
+    visualize.add_argument("--dpi", type=int, default=160)
     return root
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
+    if args.command == "visualize":
+        output = plot_trajectory(
+            args.history,
+            args.output,
+            metric=args.metric,
+            title=args.title,
+            dpi=args.dpi,
+        )
+        print(json.dumps({"output": os.path.abspath(output)}, sort_keys=True))
+        return 0
     workload = Workload(args.m, args.n, args.k, args.threads, args.cpus)
     runner = MatOptRunner(args.runner, timeout=args.timeout)
     profile = MeasurementProfile(
