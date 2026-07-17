@@ -48,6 +48,10 @@ uv run matopt-tuner tune \
   --history run.jsonl --output plans.json
 ```
 
+Add `-v` for compact colored workload, search-space, generation, and selected
+plan summaries on stderr. Use `-vv` to include each candidate result;
+machine-readable final JSON remains alone on stdout.
+
 An explicit Linux CPU mask is required. See
 `docs/external_tuner_design.md` for the architecture and LFBO workflow, and
 `docs/design.md` for the audited native-backend design. The complete blocking,

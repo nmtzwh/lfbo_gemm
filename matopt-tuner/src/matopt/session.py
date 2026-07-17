@@ -4,7 +4,7 @@ import os
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List
 
 from .history import History
 from .objectives import pareto, select
@@ -62,6 +62,7 @@ class TuningSession:
         algorithm: str = "random",
         lfbo_config: LFBOConfig | None = None,
         space_config: SpaceConfig | None = None,
+        progress: Callable[[str, Dict[str, Any]], None] | None = None,
         output: str | os.PathLike[str] | None = None,
     ) -> Dict[str, Any]:
         if objective not in {"one_shot", "steady", "throughput"}:
@@ -119,6 +120,35 @@ class TuningSession:
             history.append(baseline_record)
             records.append(baseline_record)
         completed[baseline_hash] = baseline_record
+
+        if progress is not None:
+            progress(
+                "start",
+                {
+                    "workload": self.workload,
+                    "capabilities": caps,
+                    "space": space_description,
+                    "objective": objective,
+                    "algorithm": (
+                        algorithm if search is None else type(search).__name__
+                    ),
+                    "budget": budget,
+                    "resumed": sum(
+                        plan_hash != baseline_hash for plan_hash in completed
+                    ),
+                },
+            )
+            progress(
+                "baseline",
+                {
+                    "record": baseline_record,
+                    "prior_records": [
+                        record
+                        for plan_hash, record in completed.items()
+                        if plan_hash != baseline_hash
+                    ],
+                },
+            )
 
         if search is None:
             if algorithm == "random":
@@ -194,6 +224,8 @@ class TuningSession:
             completed[digest] = record
             evaluated.append(record)
             search.tell(plan, response)
+            if progress is not None:
+                progress("candidate", {"record": record})
 
         benchmarked = [r for r in evaluated if r.get("state") == "benchmarked"]
         selected = select(benchmarked, objective, baseline_record)
@@ -225,4 +257,6 @@ class TuningSession:
                 stream.write(canonical_json(result))
                 stream.write("\n")
             os.replace(temporary, destination)
+        if progress is not None:
+            progress("finish", {"result": result})
         return result

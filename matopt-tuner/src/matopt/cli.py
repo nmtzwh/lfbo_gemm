@@ -5,6 +5,7 @@ import json
 import os
 
 from .protocol import MeasurementProfile, Workload
+from .reporting import ConsoleReporter
 from .runner import MatOptRunner
 from .search.lfbo import LFBOConfig
 from .session import TuningSession
@@ -28,6 +29,19 @@ def parser() -> argparse.ArgumentParser:
     tune.add_argument("--budget", type=int, default=256)
     tune.add_argument("--search", choices=("random", "lfbo"), default="random")
     tune.add_argument("--seed", type=int, default=19260817)
+    tune.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="show generation progress; repeat for every candidate",
+    )
+    tune.add_argument(
+        "--color",
+        choices=("auto", "always", "never"),
+        default="auto",
+        help="ANSI color policy for verbose stderr output",
+    )
     tune.add_argument("--history", required=True)
     tune.add_argument("--output", required=True)
     tune.add_argument(
@@ -99,6 +113,11 @@ def main(argv: list[str] | None = None) -> int:
         ),
         space_config=(
             SpaceConfig.load(args.space_config) if args.space_config else None
+        ),
+        progress=(
+            ConsoleReporter(level=args.verbose, color=args.color)
+            if args.verbose
+            else None
         ),
         output=args.output,
     )

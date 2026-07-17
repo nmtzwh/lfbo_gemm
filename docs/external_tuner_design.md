@@ -53,6 +53,13 @@ limits, persists the effective domains, and incorporates the effective space
 into resume identity. Runner-reported capabilities and native finalization
 remain authoritative.
 
+The CLI exposes two diagnostic verbosity levels without changing its
+machine-readable stdout contract. `-v` writes compact problem, effective-space,
+baseline, generation, current-optimum, and final-selection summaries to
+stderr. `-vv` additionally reports every terminal candidate. ANSI emphasis is
+TTY-aware and controlled by `--color`; redirected stdout remains the single
+final JSON object.
+
 ## Ownership boundary
 
 ### oneDNN patch

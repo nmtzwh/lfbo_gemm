@@ -55,6 +55,26 @@ The effective domains, canonical configuration, and `space_hash` are written
 to the result. An explicit configuration is included in the JSONL history
 fingerprint, so changing it rejects resume against an older history.
 
+## Console progress
+
+The default command keeps stdout machine-readable and prints only the final
+JSON object. Add `-v` for compact human-readable progress on stderr:
+
+```bash
+uv run matopt-tuner tune ... -v
+```
+
+This reports the workload and ISA, effective search domains, baseline, one
+summary per LFBO generation, current best parameters and improvement, and the
+final selected plan. Use `-vv` to include every benchmarked or rejected
+candidate. Important values are colored when stderr is a terminal. Use
+`--color always` to preserve color through a log capture or `--color never` to
+disable ANSI sequences. Setting the standard `NO_COLOR` environment variable
+also disables automatic color.
+
+Verbose diagnostics never go to stdout, so scripts may continue parsing the
+final JSON response unchanged.
+
 ## Optimization trajectory
 
 Render benchmarked latencies in evaluation order, colored by LFBO generation,

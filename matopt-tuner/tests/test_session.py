@@ -89,6 +89,21 @@ class OnePlanSearch:
 
 
 class SessionTests(unittest.TestCase):
+    def test_progress_events_cover_runtime_lifecycle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            events = []
+            TuningSession(
+                Workload(64, 64, 64, 1, "0"),
+                FakeRunner(),
+                history=Path(directory) / "history.jsonl",
+            ).tune(
+                budget=1,
+                search=OnePlanSearch(dict(PLAN, N_chunk_size=2)),
+                progress=lambda event, payload: events.append(event),
+                measurement=MeasurementProfile(samples=1, minimum_sample_ms=1),
+            )
+            self.assertEqual(events, ["start", "baseline", "candidate", "finish"])
+
     def test_resume_does_not_repeat_candidate(self):
         with tempfile.TemporaryDirectory() as directory:
             history = Path(directory) / "history.jsonl"
