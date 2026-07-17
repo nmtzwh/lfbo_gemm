@@ -93,6 +93,40 @@ class NativeAVX2Tests(unittest.TestCase):
         self.assertEqual(result["status"], "benchmarked")
         self.assertEqual(result["finalized"]["plan"]["M_chunk_size"], 2)
 
+    def test_aot_capture_replays_copied_images(self):
+        caps = self.runner.capabilities(self.workload)
+        baseline = self.runner.baseline(
+            self.workload, self.profile, caps["fingerprint"]
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            captured = self.runner.capture_aot(
+                self.workload,
+                baseline["effective_plan"],
+                caps["fingerprint"],
+                directory,
+            )
+            self.assertEqual(captured["status"], "captured")
+            self.assertTrue(captured["aot_bundle"]["copied_address_replay"])
+            self.assertTrue(captured["aot_bundle"]["images"])
+            for image in captured["aot_bundle"]["images"]:
+                self.assertEqual(len(image["sha256"]), 64)
+                self.assertTrue((Path(directory) / image["file"]).is_file())
+        persistent = dict(
+            baseline["effective_plan"], N_blk=32, pack_b="persistent_n32"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            captured = self.runner.capture_aot(
+                self.workload,
+                persistent,
+                caps["fingerprint"],
+                directory,
+            )
+            self.assertEqual(captured["status"], "captured")
+            self.assertIn(
+                "reorder",
+                {image["group"] for image in captured["aot_bundle"]["images"]},
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

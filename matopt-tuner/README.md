@@ -75,6 +75,21 @@ also disables automatic color.
 Verbose diagnostics never go to stdout, so scripts may continue parsing the
 final JSON response unchanged.
 
+## AOT commands
+
+`matopt-tuner export` consumes a selected tuning result and enforces the
+`aot_bundle_v1` native capture contract. It validates every image hash and
+ordinal, generates the fixed-shape public header and CMake package, asks the
+runner for fresh-process zero-JIT validation, and publishes by atomic rename.
+The package embeds the images in ELF executable text and reuses the ordinary
+oneDNN MatMul driver. It rejects older runners instead of falling back to
+runtime JIT.
+
+`matopt-tuner benchmark` configures the standalone project in `../benchmark`,
+requires system OpenBLAS, and emits `correctness.json`,
+`google-benchmark.json`, and `summary.json`. Google Benchmark v1.9.5 is fetched
+only when `--fetch-google-benchmark` is explicit.
+
 ## Optimization trajectory
 
 Render benchmarked latencies in evaluation order, colored by LFBO generation,

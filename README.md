@@ -25,7 +25,7 @@ cmake -S . -B build \
   -DDNNL_CPU_RUNTIME=OMP \
   -DONEDNN_BUILD_GRAPH=OFF \
   '-DDNNL_ENABLE_PRIMITIVE=MATMUL;REORDER'
-cmake --build build --target matopt-runner
+cmake --build build --target matopt_runner
 ```
 
 `MATMUL;REORDER` is required because persistent B policies use a one-time
@@ -80,3 +80,40 @@ uv sync --extra lfbo --extra visualization
 uv run matopt-tuner visualize \
   --history run.jsonl --output trajectory.png --metric one_shot
 ```
+
+## AOT export and OpenBLAS comparison
+
+The Python exporter implements strict result selection, live-fingerprint and
+re-finalization checks, `aot_bundle_v1` image validation, stable kernel IDs,
+generated C++/CMake consumers, fresh-process validation, and atomic publication:
+
+```bash
+matopt-tuner export \
+  --result plans.json --objective one_shot \
+  --runner /path/to/matopt-runner \
+  --onednn-build /home/weihe/tmp/onednn-build \
+  --build-dir /home/weihe/tmp/matopt-aot-build \
+  --output /path/to/kernel-package
+```
+
+Export fails closed unless the native runner's `capture-aot` and `validate-aot`
+commands return a schema-versioned image inventory, replay every image from a
+different address, and prove zero JIT events in a fresh process. The exported
+ELF binds those images through oneDNN's existing typed kernel objects; a normal
+oneDNN primitive or cache blob is never mislabeled as AOT.
+
+Once given a validated package, the standalone project in `benchmark/` checks
+both API modes and stale prepared weights against OpenBLAS, then runs the five
+Google Benchmark cases with fixed affinity:
+
+```bash
+matopt-tuner benchmark \
+  --kernel /path/to/kernel-package --cpus 0-3 \
+  --build-dir /home/weihe/tmp/matopt-benchmark-build \
+  --output /path/to/benchmark-report
+```
+
+Google Benchmark is never downloaded implicitly. Add
+`--fetch-google-benchmark` to fetch pinned release `v1.9.5`; otherwise an
+installed CMake package is required. A system OpenBLAS CBLAS library is always
+required.

@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index adb97f4bd896014a351336313d8a87d395c50cfe..b2f7825bfd7c3c32cd38ba86ad7ea5d362e3ae5e 100644
+index adb97f4..b2f7825 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -139,6 +139,16 @@ configure_file(
@@ -31,7 +31,7 @@ index adb97f4bd896014a351336313d8a87d395c50cfe..b2f7825bfd7c3c32cd38ba86ad7ea5d3
      install(FILES LICENSE DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${LIB_PACKAGE_NAME})
      install(FILES THIRD-PARTY-PROGRAMS DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${LIB_PACKAGE_NAME})
 diff --git a/cmake/options.cmake b/cmake/options.cmake
-index 0cf7585eff81473ab24f6d773cd1b88daf5d4b4d..8c37e73803d6e91ba375ac8258bfcb396a52ef20 100644
+index 0cf7585..8c37e73 100644
 --- a/cmake/options.cmake
 +++ b/cmake/options.cmake
 @@ -72,6 +72,8 @@ set(ONEDNN_DOC_VERSIONS_JSON "" CACHE STRING "Location of JSON file for
@@ -44,7 +44,7 @@ index 0cf7585eff81473ab24f6d773cd1b88daf5d4b4d..8c37e73803d6e91ba375ac8258bfcb39
      "specifies whether oneDNN library will use special testing environment for
      internal testing processes"
 diff --git a/src/cpu/CMakeLists.txt b/src/cpu/CMakeLists.txt
-index 7a0b20c47f84985022f31569cefa2b54f329648e..f7798d34029fe9febebf1c1a5cdfccd024d4cd6d 100644
+index 7a0b20c..f7798d3 100644
 --- a/src/cpu/CMakeLists.txt
 +++ b/src/cpu/CMakeLists.txt
 @@ -29,6 +29,14 @@ foreach(SOURCE_FILE ${SOURCES_EXTRA})
@@ -63,7 +63,7 @@ index 7a0b20c47f84985022f31569cefa2b54f329648e..f7798d34029fe9febebf1c1a5cdfccd0
      file(GLOB_RECURSE SOURCES_JIT_UTILS
          ${CMAKE_CURRENT_SOURCE_DIR}/jit_utils/*.[ch]
 diff --git a/src/cpu/aarch64/brgemm/brgemm_utils.cpp b/src/cpu/aarch64/brgemm/brgemm_utils.cpp
-index 885aae610640b290d4e4ae42fe4a61f4ab02d3ea..bfe8a03892c4cbcb76141102c687f67f086870f2 100644
+index 885aae6..bfe8a03 100644
 --- a/src/cpu/aarch64/brgemm/brgemm_utils.cpp
 +++ b/src/cpu/aarch64/brgemm/brgemm_utils.cpp
 @@ -192,21 +192,34 @@ status_t brgemm_blocking(brgemm_desc_t *brg) {
@@ -113,8 +113,74 @@ index 885aae610640b290d4e4ae42fe4a61f4ab02d3ea..bfe8a03892c4cbcb76141102c687f67f
      brg->bdb = brg->bcast_dim / brg->bd_block;
      brg->bdb_tail = brg->bcast_dim % brg->bd_block;
  
+diff --git a/src/cpu/aarch64/jit_generator.hpp b/src/cpu/aarch64/jit_generator.hpp
+index c0efc1f..0f89c3f 100644
+--- a/src/cpu/aarch64/jit_generator.hpp
++++ b/src/cpu/aarch64/jit_generator.hpp
+@@ -27,6 +27,9 @@
+ #include "cpu/aarch64/cpu_isa_traits.hpp"
+ 
+ #include "cpu/jit_utils/jit_utils.hpp"
++#ifdef DNNL_BUILD_MATOPT
++#include "cpu/matmul/matopt_backend.hpp"
++#endif
+ 
+ #if defined(_WIN32) && !defined(__GNUC__)
+ #define STRUCT_ALIGN(al, ...) __declspec(align(al)) __VA_ARGS__
+@@ -847,12 +850,20 @@ public:
+ 
+     DNNL_DISALLOW_COPY_AND_ASSIGN(jit_generator_t);
+ 
++    static void *matopt_code_buffer(void *code_ptr, bool use_autogrow) {
++        if (code_ptr) return code_ptr;
++#ifdef DNNL_BUILD_MATOPT
++        size_t size = 0;
++        const uint8_t *code = matopt::aot_replay_buffer(size);
++        if (code) return const_cast<uint8_t *>(code);
++#endif
++        return use_autogrow ? Xbyak_aarch64::AutoGrow : nullptr;
++    }
++
+     jit_generator_t(void *code_ptr = nullptr, size_t code_size = MAX_CODE_SIZE,
+             bool use_autogrow = true, cpu_isa_t max_cpu_isa = isa_all)
+         : Xbyak_aarch64::CodeGenerator(code_size,
+-                  (code_ptr == nullptr && use_autogrow)
+-                          ? Xbyak_aarch64::AutoGrow
+-                          : code_ptr)
++                  matopt_code_buffer(code_ptr, use_autogrow))
+         , max_cpu_isa_(max_cpu_isa) {}
+     ~jit_generator_t() override = default;
+ 
+@@ -873,8 +884,27 @@ public:
+     }
+ 
+     virtual status_t create_kernel() {
++#ifdef DNNL_BUILD_MATOPT
++        const uint8_t *replay_code = nullptr;
++        size_t replay_size = 0;
++        std::string replay_error;
++        if (matopt::aot_bind_replay(
++                    name(), replay_code, replay_size, replay_error)) {
++            if (!replay_code) {
++                matopt::set_error(replay_error);
++                return status::runtime_error;
++            }
++            jit_ker_ = replay_code;
++            return status::success;
++        }
++#endif
+         generate();
+         jit_ker_ = getCode();
++#ifdef DNNL_BUILD_MATOPT
++        if (jit_ker_)
++            matopt::aot_record_generated(
++                    name(), jit_ker_, getSize() * CSIZE);
++#endif
+         return (jit_ker_) ? status::success : status::runtime_error;
+     }
+ 
 diff --git a/src/cpu/aarch64/matmul/brgemm_matmul.cpp b/src/cpu/aarch64/matmul/brgemm_matmul.cpp
-index bfc4187759f564bb85362ae64aa995b5a133ef7b..485309a43444fdf5a8f62fbcd2ae14a0b01946a9 100644
+index bfc4187..485309a 100644
 --- a/src/cpu/aarch64/matmul/brgemm_matmul.cpp
 +++ b/src/cpu/aarch64/matmul/brgemm_matmul.cpp
 @@ -28,6 +28,9 @@
@@ -157,7 +223,7 @@ index bfc4187759f564bb85362ae64aa995b5a133ef7b..485309a43444fdf5a8f62fbcd2ae14a0
          bgmmc_.wsp_tile_per_thr_bytes = nstl::max(
                  brg.get_wsp_buffer_size(), bgmmc_.wsp_tile_per_thr_bytes);
 diff --git a/src/cpu/aarch64/matmul/brgemm_matmul_copy_utils.cpp b/src/cpu/aarch64/matmul/brgemm_matmul_copy_utils.cpp
-index 805a47147f374fcb6448a7b220b6794a59e289cd..923565ce3294bdd3c8eec8ff25c09eedb28b96cf 100644
+index 805a471..923565c 100644
 --- a/src/cpu/aarch64/matmul/brgemm_matmul_copy_utils.cpp
 +++ b/src/cpu/aarch64/matmul/brgemm_matmul_copy_utils.cpp
 @@ -24,6 +24,10 @@
@@ -218,7 +284,7 @@ index 805a47147f374fcb6448a7b220b6794a59e289cd..923565ce3294bdd3c8eec8ff25c09eed
          CHECK(safe_ptr_assign(copy_ker,
                  new jit_brgemm_matmul_copy_a_transposed_impl_t(conf)));
 diff --git a/src/cpu/aarch64/matmul/brgemm_matmul_utils.cpp b/src/cpu/aarch64/matmul/brgemm_matmul_utils.cpp
-index 87aabed00361554548abb4bd4125355d86595e38..a436a0273d23e6ba37feef559743838bfa60e25d 100644
+index 87aabed..a436a02 100644
 --- a/src/cpu/aarch64/matmul/brgemm_matmul_utils.cpp
 +++ b/src/cpu/aarch64/matmul/brgemm_matmul_utils.cpp
 @@ -17,6 +17,9 @@
@@ -253,12 +319,210 @@ index 87aabed00361554548abb4bd4125355d86595e38..a436a0273d23e6ba37feef559743838b
  
      return status::success;
  }
+diff --git a/src/cpu/x64/brgemm/brgemm_utils.cpp b/src/cpu/x64/brgemm/brgemm_utils.cpp
+index 1dfeedd..da0991c 100644
+--- a/src/cpu/x64/brgemm/brgemm_utils.cpp
++++ b/src/cpu/x64/brgemm/brgemm_utils.cpp
+@@ -768,7 +768,11 @@ status_t brgemm_blocking_vmm(brgemm_desc_t *brg) {
+     bool few_regs = utils::one_of(brg->isa_impl, avx2, avx2_vnni, avx2_vnni_2);
+     bool hint_n_bcast_1_load
+             = brg->brgattr.hint_loop_order == brgemm_lo_bl_1load;
+-    for (int try_ld_block2 = 4; try_ld_block2 > 0; --try_ld_block2) {
++    const int requested_ld_block2 = brg->brgattr.hint_ld_block2;
++    if (requested_ld_block2 < 0 || requested_ld_block2 > 4)
++        return status::invalid_arguments;
++    for (int try_ld_block2 = requested_ld_block2 ? requested_ld_block2 : 4;
++            try_ld_block2 > 0; --try_ld_block2) {
+         adj_ld_block2 = calculate_ldb_params(brg, try_ld_block2);
+         brg->n_bcast_1_load
+                 = (few_regs && adj_ld_block2 == 4) || hint_n_bcast_1_load;
+@@ -776,6 +780,7 @@ status_t brgemm_blocking_vmm(brgemm_desc_t *brg) {
+         const auto bdb_tail = brg->bcast_dim % max_bcast_block;
+         min_bcast_block = bdb_tail > 0 ? bdb_tail : max_bcast_block;
+         if (min_bcast_block >= max_vpad) break;
++        if (requested_ld_block2) return status::invalid_arguments;
+     }
+     // bcast block in brgemm kernel should be greater than virtual
+     // padding to avoid possible functional issues
+@@ -783,9 +788,17 @@ status_t brgemm_blocking_vmm(brgemm_desc_t *brg) {
+ 
+     const int min_block = nstl::max(1, max_vpad);
+ 
++    const int requested_bd_block = brg->brgattr.hint_bd_block;
++    if (requested_bd_block < 0 || requested_bd_block > max_bcast_block
++            || requested_bd_block > brg->bcast_dim)
++        return status::invalid_arguments;
++
+     float best_bd_block_eff = 0.f;
+-    brg->bd_block = max_bcast_block;
+-    for (int bd_block = max_bcast_block; bd_block >= min_block; bd_block--) {
++    brg->bd_block = requested_bd_block ? requested_bd_block : max_bcast_block;
++    for (int bd_block
++            = requested_bd_block ? requested_bd_block : max_bcast_block;
++            bd_block >= (requested_bd_block ? requested_bd_block : min_block);
++            bd_block--) {
+         // avoid msvc warning 'potential divide by zero'
+         const auto bd_block_disb = (brg->bcast_dim <= 0 || bd_block == 0)
+                 ? 0.f
+@@ -804,6 +817,8 @@ status_t brgemm_blocking_vmm(brgemm_desc_t *brg) {
+             best_bd_block_eff = bd_block_eff;
+         }
+     }
++    if (requested_bd_block && best_bd_block_eff == 0.f)
++        return status::invalid_arguments;
+     brg->bdb = brg->bcast_dim / brg->bd_block;
+     brg->bdb_tail = brg->bcast_dim % brg->bd_block;
+ 
+diff --git a/src/cpu/x64/jit_generator.hpp b/src/cpu/x64/jit_generator.hpp
+index 4e6bb4d..f655bc5 100644
+--- a/src/cpu/x64/jit_generator.hpp
++++ b/src/cpu/x64/jit_generator.hpp
+@@ -28,6 +28,9 @@
+ #include "cpu/x64/cpu_isa_traits.hpp"
+ 
+ #include "cpu/jit_utils/jit_utils.hpp"
++#ifdef DNNL_BUILD_MATOPT
++#include "cpu/matmul/matopt_backend.hpp"
++#endif
+ 
+ #if defined(_WIN32) && !defined(__GNUC__)
+ #define STRUCT_ALIGN(al, ...) __declspec(align(al)) __VA_ARGS__
+@@ -2752,9 +2755,18 @@ public:
+ 
+     /* All uni_ instructions -- apart from uni_vzeroupper() -- will comply with
+      * the max_cpu_isa argument */
++    static void *matopt_code_buffer() {
++#ifdef DNNL_BUILD_MATOPT
++        size_t size = 0;
++        const uint8_t *code = matopt::aot_replay_buffer(size);
++        if (code) return const_cast<uint8_t *>(code);
++#endif
++        return Xbyak::AutoGrow;
++    }
++
+     jit_generator_t(const char *name, cpu_isa_t max_cpu_isa = get_max_cpu_isa())
+         : Xbyak::MmapAllocator(name)
+-        , Xbyak::CodeGenerator(max_code_size, Xbyak::AutoGrow,
++        , Xbyak::CodeGenerator(max_code_size, matopt_code_buffer(),
+                   /*allocator=*/this)
+         , max_cpu_isa_(max_cpu_isa) {}
+ 
+@@ -2777,11 +2789,29 @@ public:
+     }
+ 
+     virtual status_t create_kernel() {
++#ifdef DNNL_BUILD_MATOPT
++        const uint8_t *replay_code = nullptr;
++        size_t replay_size = 0;
++        std::string replay_error;
++        if (matopt::aot_bind_replay(
++                    name(), replay_code, replay_size, replay_error)) {
++            if (!replay_code) {
++                matopt::set_error(replay_error);
++                return status::runtime_error;
++            }
++            jit_ker_ = replay_code;
++            return status::success;
++        }
++#endif
+         int err_code = Xbyak::GetError();
+         if (err_code == Xbyak::ERR_CANT_ALLOC) return status::out_of_memory;
+         if (err_code != Xbyak::ERR_NONE) return status::runtime_error;
+         generate();
+         jit_ker_ = getCode();
++#ifdef DNNL_BUILD_MATOPT
++        if (jit_ker_)
++            matopt::aot_record_generated(name(), jit_ker_, getSize());
++#endif
+         return (jit_ker_) ? status::success : status::runtime_error;
+     }
+ 
+diff --git a/src/cpu/x64/matmul/brgemm_matmul.cpp b/src/cpu/x64/matmul/brgemm_matmul.cpp
+index e42a436..2f78bbb 100644
+--- a/src/cpu/x64/matmul/brgemm_matmul.cpp
++++ b/src/cpu/x64/matmul/brgemm_matmul.cpp
+@@ -28,6 +28,9 @@
+ #include "cpu/x64/amx_tile_configure.hpp"
+ #include "cpu/x64/injectors/jit_uni_binary_injector.hpp"
+ #include "cpu/x64/matmul/brgemm_matmul.hpp"
++#if DNNL_BUILD_MATOPT
++#include "cpu/matmul/matopt_backend.hpp"
++#endif
+ 
+ // This is required to implement `can_use_gemm_fallback`.
+ #include "cpu/matmul/gemm_bf16_matmul.hpp"
+@@ -412,6 +415,19 @@ status_t brgemm_matmul_t<isa>::pd_t::init(engine_t *engine) {
+         brgattr.mem_advice = bgmmc_.mem_advice;
+         brgattr.max_bs = bs;
+         brgattr.hint_prefetchw = bgmmc_.hint_prefetchw;
++#if DNNL_BUILD_MATOPT
++        const auto *matopt_plan = matopt::active_plan();
++        const bool matopt_full_desc
++                = i_bs == 0 && i_M == 0 && i_N == 0 && i_K == 0;
++        if (matopt_plan && matopt_full_desc) {
++            brgattr.hint_bd_block = matopt_plan->bd_block;
++            brgattr.hint_ld_block2 = matopt_plan->ld_block2;
++            brgattr.hint_loop_order
++                    = matopt_plan->loop_order == matopt::loop_order_t::one_load
++                    ? brgemm_lo_bl_1load
++                    : brgemm_lo_default;
++        }
++#endif
+         if (is_superset(kernel_isa, avx512_core_amx)) {
+             brgattr.use_uker = true;
+             brgattr.use_interleave_stores = true;
+@@ -443,6 +459,11 @@ status_t brgemm_matmul_t<isa>::pd_t::init(engine_t *engine) {
+ 
+         CHECK(brgemm_desc_set_attr(&brg, brgattr));
+         CHECK(brgemm_desc_finalize(&brg));
++#if DNNL_BUILD_MATOPT
++        if (i_bs == 0 && i_M == 0 && i_N == 0 && i_K == 0)
++            matopt::capture_microtile(
++                    brg.bd_block, brg.ld_block2, brg.get_wsp_buffer_size());
++#endif
+ 
+         bgmmc_.wsp_tile_per_thr_bytes = nstl::max(
+                 brg.get_wsp_buffer_size(), bgmmc_.wsp_tile_per_thr_bytes);
+diff --git a/src/cpu/x64/matmul/brgemm_matmul_utils.cpp b/src/cpu/x64/matmul/brgemm_matmul_utils.cpp
+index 9996347..b69a376 100644
+--- a/src/cpu/x64/matmul/brgemm_matmul_utils.cpp
++++ b/src/cpu/x64/matmul/brgemm_matmul_utils.cpp
+@@ -24,6 +24,9 @@
+ #include "cpu/x64/injectors/jit_uni_postops_injector.hpp"
+ #include "cpu/x64/matmul/amx_blocking_heuristics.hpp"
+ #include "cpu/x64/matmul/brgemm_matmul_utils.hpp"
++#if DNNL_BUILD_MATOPT
++#include "cpu/matmul/matopt_backend.hpp"
++#endif
+ #include "cpu/x64/matmul/postops_estimator.hpp"
+ #include "oneapi/dnnl/dnnl_debug.h"
+ 
+@@ -1814,6 +1817,9 @@ status_t init_brgemm_matmul_conf(cpu_isa_t isa, brgemm_matmul_conf_t &bgmmc,
+     // - nthr_K
+     VCHECK_BG(compute_blocking_heuristic(bgmmc, bm_conf_utils),
+             VERBOSE_BLOCKING_FAIL, "");
++#if DNNL_BUILD_MATOPT
++    VCHECK_BG(matopt::apply_plan(bgmmc), VERBOSE_BLOCKING_FAIL, "");
++#endif
+ 
+     if (bgmmc.wei_n_blk > bgmmc.N_blk && bgmmc.N != bgmmc.N_blk) {
+         assert(!bgmmc.is_runtime_N
+@@ -1877,6 +1883,9 @@ status_t init_brgemm_matmul_conf(cpu_isa_t isa, brgemm_matmul_conf_t &bgmmc,
+ 
+     // Sets things related to chunks and others
+     init_aux_values(bgmmc, src_d, weights_d, dst_d);
++#if DNNL_BUILD_MATOPT
++    matopt::capture(bgmmc);
++#endif
+ 
+     const bool need_store_prfw = bgmmc.N <= 14528
+             && ((bgmmc.M <= 768 && bgmmc.K <= 128)
 diff --git a/src/cpu/matmul/matopt_backend.cpp b/src/cpu/matmul/matopt_backend.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..2283305ab2b4c0fc6815a38bfde1f741c3832382
+index 0000000..b092834
 --- /dev/null
 +++ b/src/cpu/matmul/matopt_backend.cpp
-@@ -0,0 +1,64 @@
+@@ -0,0 +1,210 @@
 +/*******************************************************************************
 +* Copyright 2026
 +*
@@ -266,6 +530,10 @@ index 0000000000000000000000000000000000000000..2283305ab2b4c0fc6815a38bfde1f741
 +******************************************************************************/
 +
 +#include "cpu/matmul/matopt_backend.hpp"
++
++#include <map>
++#include <stdexcept>
++#include <utility>
 +
 +namespace dnnl {
 +namespace impl {
@@ -277,7 +545,149 @@ index 0000000000000000000000000000000000000000..2283305ab2b4c0fc6815a38bfde1f741
 +thread_local finalized_plan_t captured;
 +thread_local bool captured_valid = false;
 +thread_local std::string last_error;
++
++struct aot_state_t {
++    aot_mode_t mode = aot_mode_t::disabled;
++    std::string group = "matmul";
++    std::vector<aot_image_t> captured_images;
++    const aot_replay_image_t *replay_images = nullptr;
++    size_t replay_count = 0;
++    size_t replay_index = 0;
++    std::map<std::string, size_t> next_capture_ordinal;
++    std::map<std::string, size_t> next_replay_ordinal;
++    uint64_t jit_events = 0;
++    uint64_t bind_events = 0;
++    std::string error;
++};
++thread_local aot_state_t aot_state;
 +} // namespace
++
++void aot_begin_capture() {
++    if (aot_state.mode != aot_mode_t::disabled)
++        throw std::runtime_error("nested MatOpt AOT session");
++    aot_state = aot_state_t();
++    aot_state.mode = aot_mode_t::capture;
++}
++
++std::vector<aot_image_t> aot_end_capture() {
++    if (aot_state.mode != aot_mode_t::capture)
++        throw std::runtime_error("MatOpt AOT capture is not active");
++    auto images = std::move(aot_state.captured_images);
++    aot_state = aot_state_t();
++    return images;
++}
++
++void aot_begin_replay(const aot_replay_image_t *images, size_t count) {
++    if (aot_state.mode != aot_mode_t::disabled)
++        throw std::runtime_error("nested MatOpt AOT session");
++    if (!images || count == 0)
++        throw std::runtime_error("empty MatOpt AOT replay bundle");
++    aot_state = aot_state_t();
++    aot_state.mode = aot_mode_t::replay;
++    aot_state.replay_images = images;
++    aot_state.replay_count = count;
++}
++
++bool aot_end_replay(std::string &error) {
++    if (aot_state.mode != aot_mode_t::replay) {
++        error = "MatOpt AOT replay is not active";
++        return false;
++    }
++    bool ok = aot_state.error.empty()
++            && aot_state.replay_index == aot_state.replay_count;
++    if (!ok) {
++        if (!aot_state.error.empty())
++            error = aot_state.error;
++        else
++            error = "unconsumed MatOpt AOT images: expected "
++                    + std::to_string(aot_state.replay_count) + ", consumed "
++                    + std::to_string(aot_state.replay_index);
++    }
++    aot_state = aot_state_t();
++    return ok;
++}
++
++void aot_abort() {
++    aot_state = aot_state_t();
++}
++
++void aot_set_group(const char *group) {
++    if (aot_state.mode != aot_mode_t::disabled)
++        aot_state.group = group && *group ? group : "matmul";
++}
++
++aot_mode_t aot_mode() {
++    return aot_state.mode;
++}
++
++const uint8_t *aot_replay_buffer(size_t &size) {
++    size = 0;
++    if (aot_state.mode != aot_mode_t::replay
++            || aot_state.replay_index >= aot_state.replay_count)
++        return nullptr;
++    const auto &image = aot_state.replay_images[aot_state.replay_index];
++    size = image.size;
++    return image.code;
++}
++
++bool aot_bind_replay(const char *generator_name, const uint8_t *&code,
++        size_t &size, std::string &error) {
++    code = nullptr;
++    size = 0;
++    if (aot_state.mode != aot_mode_t::replay) return false;
++    if (aot_state.replay_index >= aot_state.replay_count) {
++        error = "unexpected JIT generator after the AOT bundle was exhausted: "
++                + std::string(generator_name ? generator_name : "unknown");
++        aot_state.error = error;
++        return true;
++    }
++    const auto &image = aot_state.replay_images[aot_state.replay_index];
++    const std::string actual_name = generator_name ? generator_name : "unknown";
++    const std::string expected_name
++            = image.generator_name ? image.generator_name : "unknown";
++    const std::string expected_group = image.group ? image.group : "matmul";
++    const size_t expected_ordinal
++            = aot_state.next_replay_ordinal[aot_state.group];
++    if (expected_group != aot_state.group || image.ordinal != expected_ordinal
++            || expected_name != actual_name || !image.code || image.size == 0) {
++        error = "MatOpt AOT image mismatch at ordinal "
++                + std::to_string(aot_state.replay_index) + ": expected "
++                + expected_group + "/" + expected_name + ", got "
++                + aot_state.group + "/" + actual_name;
++        aot_state.error = error;
++        return true;
++    }
++    code = image.code;
++    size = image.size;
++    ++aot_state.replay_index;
++    ++aot_state.next_replay_ordinal[aot_state.group];
++    ++aot_state.bind_events;
++    return true;
++}
++
++void aot_record_generated(
++        const char *generator_name, const uint8_t *code, size_t size) {
++    if (aot_state.mode == aot_mode_t::disabled) return;
++    ++aot_state.jit_events;
++    if (aot_state.mode != aot_mode_t::capture || !code || size == 0) {
++        aot_state.error = "JIT generation occurred during required AOT replay";
++        return;
++    }
++    aot_image_t image;
++    image.group = aot_state.group;
++    image.ordinal = aot_state.next_capture_ordinal[aot_state.group]++;
++    image.generator_name = generator_name ? generator_name : "unknown";
++    image.bytes.assign(code, code + size);
++    aot_state.captured_images.emplace_back(std::move(image));
++}
++
++uint64_t aot_jit_generation_events() {
++    return aot_state.jit_events;
++}
++
++uint64_t aot_replay_bind_events() {
++    return aot_state.bind_events;
++}
 +
 +scoped_plan_t::scoped_plan_t(const plan_t *plan) : previous_(current_plan) {
 +    current_plan = plan;
@@ -325,10 +735,10 @@ index 0000000000000000000000000000000000000000..2283305ab2b4c0fc6815a38bfde1f741
 +} // namespace dnnl
 diff --git a/src/cpu/matmul/matopt_backend.hpp b/src/cpu/matmul/matopt_backend.hpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..d2fa81e4fa675a2fe093ffe9bec351f1ab22d64f
+index 0000000..d9eb7da
 --- /dev/null
 +++ b/src/cpu/matmul/matopt_backend.hpp
-@@ -0,0 +1,203 @@
+@@ -0,0 +1,239 @@
 +/*******************************************************************************
 +* Copyright 2026
 +*
@@ -340,6 +750,7 @@ index 0000000000000000000000000000000000000000..d2fa81e4fa675a2fe093ffe9bec351f1
 +
 +#include <cstdint>
 +#include <string>
++#include <vector>
 +
 +#include "common/c_types_map.hpp"
 +
@@ -349,6 +760,41 @@ index 0000000000000000000000000000000000000000..d2fa81e4fa675a2fe093ffe9bec351f1
 +namespace matopt {
 +
 +constexpr uint32_t schema_version = 1;
++constexpr uint32_t aot_schema_version = 1;
++
++struct aot_image_t {
++    std::string group;
++    size_t ordinal = 0;
++    std::string generator_name;
++    std::vector<uint8_t> bytes;
++    size_t alignment = 64;
++};
++
++struct aot_replay_image_t {
++    const char *group = nullptr;
++    size_t ordinal = 0;
++    const char *generator_name = nullptr;
++    const uint8_t *code = nullptr;
++    size_t size = 0;
++    size_t alignment = 64;
++};
++
++enum class aot_mode_t { disabled, capture, replay };
++
++void aot_begin_capture();
++std::vector<aot_image_t> aot_end_capture();
++void aot_begin_replay(const aot_replay_image_t *images, size_t count);
++bool aot_end_replay(std::string &error);
++void aot_abort();
++void aot_set_group(const char *group);
++aot_mode_t aot_mode();
++const uint8_t *aot_replay_buffer(size_t &size);
++bool aot_bind_replay(const char *generator_name, const uint8_t *&code,
++        size_t &size, std::string &error);
++void aot_record_generated(
++        const char *generator_name, const uint8_t *code, size_t size);
++uint64_t aot_jit_generation_events();
++uint64_t aot_replay_bind_events();
 +
 +enum class pack_a_t { direct, per_call_padded };
 +enum class pack_b_t {
@@ -534,7 +980,7 @@ index 0000000000000000000000000000000000000000..d2fa81e4fa675a2fe093ffe9bec351f1
 +#endif
 diff --git a/src/cpu/matmul/matopt_copy_a.hpp b/src/cpu/matmul/matopt_copy_a.hpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..fd6cc68d79c24e0b49360a8f5785c7aafb127abe
+index 0000000..fd6cc68
 --- /dev/null
 +++ b/src/cpu/matmul/matopt_copy_a.hpp
 @@ -0,0 +1,44 @@
@@ -582,143 +1028,9 @@ index 0000000000000000000000000000000000000000..fd6cc68d79c24e0b49360a8f5785c7aa
 +} // namespace dnnl
 +
 +#endif
-diff --git a/src/cpu/x64/brgemm/brgemm_utils.cpp b/src/cpu/x64/brgemm/brgemm_utils.cpp
-index 1dfeedd56ca00b6e14e890782e7fa97fd13df8b9..da0991c916809b0de6f4f9872da870ac4c2a25c1 100644
---- a/src/cpu/x64/brgemm/brgemm_utils.cpp
-+++ b/src/cpu/x64/brgemm/brgemm_utils.cpp
-@@ -768,7 +768,11 @@ status_t brgemm_blocking_vmm(brgemm_desc_t *brg) {
-     bool few_regs = utils::one_of(brg->isa_impl, avx2, avx2_vnni, avx2_vnni_2);
-     bool hint_n_bcast_1_load
-             = brg->brgattr.hint_loop_order == brgemm_lo_bl_1load;
--    for (int try_ld_block2 = 4; try_ld_block2 > 0; --try_ld_block2) {
-+    const int requested_ld_block2 = brg->brgattr.hint_ld_block2;
-+    if (requested_ld_block2 < 0 || requested_ld_block2 > 4)
-+        return status::invalid_arguments;
-+    for (int try_ld_block2 = requested_ld_block2 ? requested_ld_block2 : 4;
-+            try_ld_block2 > 0; --try_ld_block2) {
-         adj_ld_block2 = calculate_ldb_params(brg, try_ld_block2);
-         brg->n_bcast_1_load
-                 = (few_regs && adj_ld_block2 == 4) || hint_n_bcast_1_load;
-@@ -776,6 +780,7 @@ status_t brgemm_blocking_vmm(brgemm_desc_t *brg) {
-         const auto bdb_tail = brg->bcast_dim % max_bcast_block;
-         min_bcast_block = bdb_tail > 0 ? bdb_tail : max_bcast_block;
-         if (min_bcast_block >= max_vpad) break;
-+        if (requested_ld_block2) return status::invalid_arguments;
-     }
-     // bcast block in brgemm kernel should be greater than virtual
-     // padding to avoid possible functional issues
-@@ -783,9 +788,17 @@ status_t brgemm_blocking_vmm(brgemm_desc_t *brg) {
- 
-     const int min_block = nstl::max(1, max_vpad);
- 
-+    const int requested_bd_block = brg->brgattr.hint_bd_block;
-+    if (requested_bd_block < 0 || requested_bd_block > max_bcast_block
-+            || requested_bd_block > brg->bcast_dim)
-+        return status::invalid_arguments;
-+
-     float best_bd_block_eff = 0.f;
--    brg->bd_block = max_bcast_block;
--    for (int bd_block = max_bcast_block; bd_block >= min_block; bd_block--) {
-+    brg->bd_block = requested_bd_block ? requested_bd_block : max_bcast_block;
-+    for (int bd_block
-+            = requested_bd_block ? requested_bd_block : max_bcast_block;
-+            bd_block >= (requested_bd_block ? requested_bd_block : min_block);
-+            bd_block--) {
-         // avoid msvc warning 'potential divide by zero'
-         const auto bd_block_disb = (brg->bcast_dim <= 0 || bd_block == 0)
-                 ? 0.f
-@@ -804,6 +817,8 @@ status_t brgemm_blocking_vmm(brgemm_desc_t *brg) {
-             best_bd_block_eff = bd_block_eff;
-         }
-     }
-+    if (requested_bd_block && best_bd_block_eff == 0.f)
-+        return status::invalid_arguments;
-     brg->bdb = brg->bcast_dim / brg->bd_block;
-     brg->bdb_tail = brg->bcast_dim % brg->bd_block;
- 
-diff --git a/src/cpu/x64/matmul/brgemm_matmul.cpp b/src/cpu/x64/matmul/brgemm_matmul.cpp
-index e42a43699b817054b09b236e81b4c57ca23186c8..2f78bbb4eb9f9900b18a2a255800063e41dfd652 100644
---- a/src/cpu/x64/matmul/brgemm_matmul.cpp
-+++ b/src/cpu/x64/matmul/brgemm_matmul.cpp
-@@ -28,6 +28,9 @@
- #include "cpu/x64/amx_tile_configure.hpp"
- #include "cpu/x64/injectors/jit_uni_binary_injector.hpp"
- #include "cpu/x64/matmul/brgemm_matmul.hpp"
-+#if DNNL_BUILD_MATOPT
-+#include "cpu/matmul/matopt_backend.hpp"
-+#endif
- 
- // This is required to implement `can_use_gemm_fallback`.
- #include "cpu/matmul/gemm_bf16_matmul.hpp"
-@@ -412,6 +415,19 @@ status_t brgemm_matmul_t<isa>::pd_t::init(engine_t *engine) {
-         brgattr.mem_advice = bgmmc_.mem_advice;
-         brgattr.max_bs = bs;
-         brgattr.hint_prefetchw = bgmmc_.hint_prefetchw;
-+#if DNNL_BUILD_MATOPT
-+        const auto *matopt_plan = matopt::active_plan();
-+        const bool matopt_full_desc
-+                = i_bs == 0 && i_M == 0 && i_N == 0 && i_K == 0;
-+        if (matopt_plan && matopt_full_desc) {
-+            brgattr.hint_bd_block = matopt_plan->bd_block;
-+            brgattr.hint_ld_block2 = matopt_plan->ld_block2;
-+            brgattr.hint_loop_order
-+                    = matopt_plan->loop_order == matopt::loop_order_t::one_load
-+                    ? brgemm_lo_bl_1load
-+                    : brgemm_lo_default;
-+        }
-+#endif
-         if (is_superset(kernel_isa, avx512_core_amx)) {
-             brgattr.use_uker = true;
-             brgattr.use_interleave_stores = true;
-@@ -443,6 +459,11 @@ status_t brgemm_matmul_t<isa>::pd_t::init(engine_t *engine) {
- 
-         CHECK(brgemm_desc_set_attr(&brg, brgattr));
-         CHECK(brgemm_desc_finalize(&brg));
-+#if DNNL_BUILD_MATOPT
-+        if (i_bs == 0 && i_M == 0 && i_N == 0 && i_K == 0)
-+            matopt::capture_microtile(
-+                    brg.bd_block, brg.ld_block2, brg.get_wsp_buffer_size());
-+#endif
- 
-         bgmmc_.wsp_tile_per_thr_bytes = nstl::max(
-                 brg.get_wsp_buffer_size(), bgmmc_.wsp_tile_per_thr_bytes);
-diff --git a/src/cpu/x64/matmul/brgemm_matmul_utils.cpp b/src/cpu/x64/matmul/brgemm_matmul_utils.cpp
-index 9996347a62db5f49c28697dec64eb23a83278cd6..b69a37672340ece40cd4e188e1fad1a1e96e84eb 100644
---- a/src/cpu/x64/matmul/brgemm_matmul_utils.cpp
-+++ b/src/cpu/x64/matmul/brgemm_matmul_utils.cpp
-@@ -24,6 +24,9 @@
- #include "cpu/x64/injectors/jit_uni_postops_injector.hpp"
- #include "cpu/x64/matmul/amx_blocking_heuristics.hpp"
- #include "cpu/x64/matmul/brgemm_matmul_utils.hpp"
-+#if DNNL_BUILD_MATOPT
-+#include "cpu/matmul/matopt_backend.hpp"
-+#endif
- #include "cpu/x64/matmul/postops_estimator.hpp"
- #include "oneapi/dnnl/dnnl_debug.h"
- 
-@@ -1814,6 +1817,9 @@ status_t init_brgemm_matmul_conf(cpu_isa_t isa, brgemm_matmul_conf_t &bgmmc,
-     // - nthr_K
-     VCHECK_BG(compute_blocking_heuristic(bgmmc, bm_conf_utils),
-             VERBOSE_BLOCKING_FAIL, "");
-+#if DNNL_BUILD_MATOPT
-+    VCHECK_BG(matopt::apply_plan(bgmmc), VERBOSE_BLOCKING_FAIL, "");
-+#endif
- 
-     if (bgmmc.wei_n_blk > bgmmc.N_blk && bgmmc.N != bgmmc.N_blk) {
-         assert(!bgmmc.is_runtime_N
-@@ -1877,6 +1883,9 @@ status_t init_brgemm_matmul_conf(cpu_isa_t isa, brgemm_matmul_conf_t &bgmmc,
- 
-     // Sets things related to chunks and others
-     init_aux_values(bgmmc, src_d, weights_d, dst_d);
-+#if DNNL_BUILD_MATOPT
-+    matopt::capture(bgmmc);
-+#endif
- 
-     const bool need_store_prfw = bgmmc.N <= 14528
-             && ((bgmmc.M <= 768 && bgmmc.K <= 128)
 diff --git a/tools/matopt/CMakeLists.txt b/tools/matopt/CMakeLists.txt
 new file mode 100644
-index 0000000000000000000000000000000000000000..8ac192a1a55614de68785ad16ebadff898dd1f5f
+index 0000000..8ac192a
 --- /dev/null
 +++ b/tools/matopt/CMakeLists.txt
 @@ -0,0 +1,26 @@
@@ -750,10 +1062,10 @@ index 0000000000000000000000000000000000000000..8ac192a1a55614de68785ad16ebadff8
 +add_test(NAME matopt_backend COMMAND matopt_backend_tests)
 diff --git a/tools/matopt/main.cpp b/tools/matopt/main.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..ab816204e32cbb74af86c29174e6eb32e7128884
+index 0000000..a094049
 --- /dev/null
 +++ b/tools/matopt/main.cpp
-@@ -0,0 +1,1071 @@
+@@ -0,0 +1,1409 @@
 +/*******************************************************************************
 +* Copyright 2026
 +* Licensed under the Apache License, Version 2.0 (the "License");
@@ -763,11 +1075,13 @@ index 0000000000000000000000000000000000000000..ab816204e32cbb74af86c29174e6eb32
 +#include <algorithm>
 +#include <cctype>
 +#include <chrono>
++#include <cerrno>
 +#include <cmath>
 +#include <cstdio>
 +#include <cstring>
 +#include <fstream>
 +#include <iostream>
++#include <limits>
 +#include <map>
 +#include <numeric>
 +#include <set>
@@ -776,9 +1090,16 @@ index 0000000000000000000000000000000000000000..ab816204e32cbb74af86c29174e6eb32
 +#include <vector>
 +#include <unordered_map>
 +
++#include <dlfcn.h>
 +#include <omp.h>
 +#include <sched.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
 +#include <unistd.h>
++#if defined(DNNL_AARCH64) && DNNL_AARCH64
++#include <linux/prctl.h>
++#include <sys/prctl.h>
++#endif
 +
 +#include "oneapi/dnnl/dnnl.hpp"
 +#include "oneapi/dnnl/dnnl_debug.h"
@@ -858,6 +1179,11 @@ index 0000000000000000000000000000000000000000..ab816204e32cbb74af86c29174e6eb32
 +    }
 +    if (std::rename(temporary.c_str(), path.c_str()) != 0)
 +        throw std::runtime_error("cannot atomically replace " + path);
++}
++void write_bytes(const std::string &path, const std::vector<uint8_t> &bytes) {
++    std::ofstream f(path.c_str(), std::ios::binary | std::ios::trunc);
++    if (!f || !f.write(reinterpret_cast<const char *>(bytes.data()), bytes.size()))
++        throw std::runtime_error("cannot write " + path);
 +}
 +void append_line(const std::string &path, const std::string &line) {
 +    std::ofstream f(path.c_str(), std::ios::binary | std::ios::app);
@@ -1004,16 +1330,21 @@ index 0000000000000000000000000000000000000000..ab816204e32cbb74af86c29174e6eb32
 +        if (line.find(needle) != std::string::npos) return line;
 +    return "unknown";
 +}
++int effective_vector_bits(const std::string &isa) {
++#if defined(DNNL_AARCH64) && DNNL_AARCH64
++    const int vector_bytes = prctl(PR_SVE_GET_VL) & PR_SVE_VL_LEN_MASK;
++    return vector_bytes > 0 ? vector_bytes * 8 : 0;
++#else
++    return isa.find("AVX512") != std::string::npos ? 512 : 256;
++#endif
++}
 +std::string machine_identity(int threads, const std::string &mask) {
 +    const auto *v = dnnl::version();
 +    const auto isa = dnnl_get_effective_cpu_isa();
 +    std::ostringstream os;
 +    os << first_matching_line("/proc/cpuinfo", "model name")
 +       << ";isa=" << dnnl_cpu_isa2str(isa) << ";vector_bits="
-+       << (std::string(dnnl_cpu_isa2str(isa)).find("AVX512")
-+                                  != std::string::npos
-+                          ? 512
-+                          : 256)
++       << effective_vector_bits(dnnl_cpu_isa2str(isa))
 +       << ";L1="
 +       << first_matching_line(
 +                  "/sys/devices/system/cpu/cpu0/cache/index0/size", "")
@@ -1153,6 +1484,7 @@ index 0000000000000000000000000000000000000000..ab816204e32cbb74af86c29174e6eb32
 +                          || plan->pack_b == pack_b_t::persistent_n64)) {
 +        dnnl::impl::cpu::matopt::clear_capture();
 +        backend scope(plan);
++        dnnl::impl::cpu::matopt::aot_set_group("matmul");
 +        const auto requested_b = persistent
 +                ? memory::desc(d.b_md.get_dims(), memory::data_type::f32,
 +                          memory::format_tag::any)
@@ -1166,9 +1498,11 @@ index 0000000000000000000000000000000000000000..ab816204e32cbb74af86c29174e6eb32
 +        if (pd.scratchpad_desc().get_size() != 0)
 +            scratchpad = memory(pd.scratchpad_desc(), eng);
 +        if (persistent) {
++            dnnl::impl::cpu::matopt::aot_set_group("reorder");
 +            reorder(b_plain, b_exec).execute(strm, b_plain, b_exec);
 +            strm.wait();
 +        }
++        dnnl::impl::cpu::matopt::aot_set_group("matmul");
 +        const bool captured = dnnl::impl::cpu::matopt::get_capture(finalized);
 +        if (plan && (!captured || finalized.realized_bd_block == 0)) {
 +            std::string why = dnnl::impl::cpu::matopt::get_error();
@@ -1788,13 +2122,325 @@ index 0000000000000000000000000000000000000000..ab816204e32cbb74af86c29174e6eb32
 +    }
 +}
 +
++struct mapped_image_t {
++    void *address = MAP_FAILED;
++    size_t mapped_size = 0;
++    ~mapped_image_t() {
++        if (address != MAP_FAILED) munmap(address, mapped_size);
++    }
++    mapped_image_t() = default;
++    mapped_image_t(const mapped_image_t &) = delete;
++    mapped_image_t &operator=(const mapped_image_t &) = delete;
++    mapped_image_t(mapped_image_t &&other) noexcept
++        : address(other.address), mapped_size(other.mapped_size) {
++        other.address = MAP_FAILED;
++        other.mapped_size = 0;
++    }
++};
++
++std::string safe_component(const std::string &value) {
++    std::string result;
++    for (char c : value)
++        result += std::isalnum(static_cast<unsigned char>(c)) ? c : '_';
++    return result.empty() ? "unknown" : result;
++}
++
++void capture_aot_command(const options_t &o) {
++    if (!o.has("request") || !o.has("bundle-dir"))
++        throw std::runtime_error(
++                "capture-aot requires --request and --bundle-dir");
++    const std::string request_text = read_file(o.get("request"));
++    const std::string id = request_id(request_text);
++    const workload_t w = workload_from_request(request_text);
++    prepare_runner(w);
++    std::string identity;
++    const std::string fingerprint = fingerprint_for(w, identity);
++    check_expected_fingerprint(request_text, fingerprint);
++    plan_t plan;
++    std::string detail;
++    if (!parse_plan_json(request_text, plan, detail))
++        throw std::runtime_error(detail);
++    if (!(detail = validate_plan(w, plan)).empty())
++        throw std::runtime_error(detail);
++
++    engine eng(engine::kind::cpu, 0);
++    data_t data(w);
++    dnnl::impl::cpu::matopt::aot_begin_capture();
++    std::vector<dnnl::impl::cpu::matopt::aot_image_t> images;
++    finalized_plan_t finalized;
++    std::vector<float> reference;
++    try {
++        case_t captured(eng, data, &plan);
++        captured.execute();
++        finalized = captured.finalized;
++        const float *result
++                = static_cast<const float *>(captured.c.get_data_handle());
++        reference.assign(result, result + data.reference.size());
++        images = dnnl::impl::cpu::matopt::aot_end_capture();
++    } catch (...) {
++        dnnl::impl::cpu::matopt::aot_abort();
++        throw;
++    }
++    if (images.empty())
++        throw std::runtime_error("AOT capture produced no JIT images");
++
++    std::vector<mapped_image_t> mappings;
++    std::vector<dnnl::impl::cpu::matopt::aot_replay_image_t> replay_images;
++    mappings.reserve(images.size());
++    replay_images.reserve(images.size());
++    const long page_size = sysconf(_SC_PAGESIZE);
++    for (const auto &image : images) {
++        mapped_image_t mapping;
++        mapping.mapped_size = ((image.bytes.size() + page_size - 1) / page_size)
++                * static_cast<size_t>(page_size);
++        mapping.address = mmap(nullptr, mapping.mapped_size,
++                PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++        if (mapping.address == MAP_FAILED)
++            throw std::runtime_error("cannot allocate copied-address AOT image");
++        std::memcpy(mapping.address, image.bytes.data(), image.bytes.size());
++        if (mprotect(mapping.address, mapping.mapped_size, PROT_READ | PROT_EXEC)
++                != 0)
++            throw std::runtime_error("cannot protect copied AOT image RX");
++        dnnl::impl::cpu::matopt::aot_replay_image_t replay;
++        replay.group = image.group.c_str();
++        replay.ordinal = image.ordinal;
++        replay.generator_name = image.generator_name.c_str();
++        replay.code = static_cast<const uint8_t *>(mapping.address);
++        replay.size = image.bytes.size();
++        replay.alignment = image.alignment;
++        mappings.emplace_back(std::move(mapping));
++        replay_images.emplace_back(replay);
++    }
++
++    dnnl::impl::cpu::matopt::aot_begin_replay(
++            replay_images.data(), replay_images.size());
++    uint64_t replay_binds = 0;
++    try {
++        case_t replayed(eng, data, &plan);
++        replay_binds
++                = dnnl::impl::cpu::matopt::aot_replay_bind_events();
++        if (!dnnl::impl::cpu::matopt::aot_end_replay(detail))
++            throw std::runtime_error(detail);
++        replayed.execute();
++        const float *result
++                = static_cast<const float *>(replayed.c.get_data_handle());
++        for (size_t i = 0; i < reference.size(); ++i) {
++            const float tolerance
++                    = 2e-4f * std::max(1.f, std::fabs(reference[i]));
++            if (!std::isfinite(result[i])
++                    || std::fabs(result[i] - reference[i]) > tolerance)
++                throw std::runtime_error(
++                        "copied-address AOT replay produced an incorrect result");
++        }
++    } catch (...) {
++        dnnl::impl::cpu::matopt::aot_abort();
++        throw;
++    }
++    if (replay_binds != images.size())
++        throw std::runtime_error("AOT replay did not bind every captured image");
++
++    const std::string root = o.get("bundle-dir");
++    const std::string image_dir = root + "/images";
++    if (mkdir(image_dir.c_str(), 0755) != 0 && errno != EEXIST)
++        throw std::runtime_error("cannot create " + image_dir);
++    std::ostringstream inventory;
++    inventory << '[';
++    for (size_t i = 0; i < images.size(); ++i) {
++        const auto &image = images[i];
++        const std::string filename = "images/" + safe_component(image.group)
++                + "-" + std::to_string(image.ordinal) + "-"
++                + safe_component(image.generator_name) + ".bin";
++        write_bytes(root + "/" + filename, image.bytes);
++        if (i) inventory << ',';
++        inventory << "{\"group\":\"" << json_escape(image.group)
++                  << "\",\"ordinal\":" << image.ordinal
++                  << ",\"name\":\"" << json_escape(image.generator_name)
++                  << "\",\"file\":\"" << json_escape(filename)
++                  << "\",\"size\":" << image.bytes.size()
++                  << ",\"alignment\":" << image.alignment
++                  << ",\"architecture\":\""
++#if defined(DNNL_X64) && DNNL_X64
++                  << "x86_64";
++#elif defined(DNNL_AARCH64) && DNNL_AARCH64
++                  << "aarch64";
++#else
++                  << "unsupported";
++#endif
++        inventory << "\"}";
++    }
++    inventory << ']';
++    const std::string isa = dnnl_cpu_isa2str(dnnl_get_effective_cpu_isa());
++    const int vector_bits = effective_vector_bits(isa);
++    std::cout << "{\"protocol_version\":1,\"request_id\":\""
++              << json_escape(id) << "\",\"status\":\"captured\""
++              << ",\"fingerprint\":\"" << fingerprint << "\""
++              << ",\"finalized\":" << finalized_json(finalized)
++              << ",\"aot_bundle\":{\"schema\":\"aot_bundle_v1\""
++              << ",\"architecture\":\""
++#if defined(DNNL_X64) && DNNL_X64
++              << "x86_64";
++#elif defined(DNNL_AARCH64) && DNNL_AARCH64
++              << "aarch64";
++#else
++              << "unsupported";
++#endif
++    std::cout << "\",\"isa\":\"" << json_escape(isa)
++              << "\",\"vector_bits\":" << vector_bits
++              << ",\"copied_address_replay\":true,\"images\":"
++              << inventory.str() << "},\"build\":{\"compiler\":\""
++              << json_escape(__VERSION__)
++              << "\",\"openmp_version\":" << _OPENMP
++              << ",\"patch_id\":\"aot-replay-v1\",\"onednn_hash\":\""
++              << json_escape(dnnl::version()->hash ? dnnl::version()->hash : "unknown")
++              << "\"}}\n";
++}
++
++bool forbidden_executable_mapping(std::string &mapping) {
++    std::ifstream maps("/proc/self/maps");
++    std::string line;
++    while (std::getline(maps, line)) {
++        const size_t permissions = line.find(' ');
++        if (permissions == std::string::npos || permissions + 4 >= line.size())
++            continue;
++        const std::string mode = line.substr(permissions + 1, 4);
++        if (mode.size() < 3 || mode[2] != 'x') continue;
++        if (mode[1] == 'w') {
++            mapping = line;
++            return true;
++        }
++        const size_t path = line.find('/', permissions + 5);
++        const bool named_special = line.find('[', permissions + 5)
++                != std::string::npos;
++        if (path == std::string::npos && !named_special) {
++            mapping = line;
++            return true;
++        }
++    }
++    return false;
++}
++
++void validate_aot_command(const options_t &o) {
++    if (!o.has("request") || !o.has("package"))
++        throw std::runtime_error(
++                "validate-aot requires --request and --package");
++    const std::string request_text = read_file(o.get("request"));
++    const std::string id = request_id(request_text);
++    const workload_t w = workload_from_request(request_text);
++    prepare_runner(w);
++    std::string identity;
++    const std::string fingerprint = fingerprint_for(w, identity);
++    check_expected_fingerprint(request_text, fingerprint);
++    const std::string manifest_path
++            = o.get("package") + "/share/matopt/manifest.json";
++    const std::string manifest = read_file(manifest_path);
++    std::string kernel_id;
++    if (!json_string(manifest, "kernel_id", kernel_id) || kernel_id.empty())
++        throw std::runtime_error("package manifest has no kernel_id");
++    const std::string library = o.get("package") + "/lib/libmatopt_kernel_"
++            + kernel_id + ".so";
++    void *handle = dlopen(library.c_str(), RTLD_NOW | RTLD_LOCAL);
++    if (!handle) throw std::runtime_error(dlerror());
++    struct library_guard_t {
++        void *value;
++        ~library_guard_t() { dlclose(value); }
++    } library_guard {handle};
++    const std::string prefix = "matopt_" + kernel_id;
++    auto symbol = [&](const char *suffix) {
++        void *value = dlsym(handle, (prefix + suffix).c_str());
++        if (!value)
++            throw std::runtime_error("missing package symbol " + prefix + suffix);
++        return value;
++    };
++    using create_fn = void *(*)();
++    using destroy_fn = void (*)(void *);
++    using prepare_fn = int (*)(void *, const float *);
++    using run_fn = int (*)(void *, const float *, const float *, float *);
++    using run_prepared_fn = int (*)(void *, const float *, float *);
++    struct runtime_info_t {
++        int compatible;
++        int warned;
++        uint64_t jit_events;
++    };
++    using info_fn = runtime_info_t (*)(const void *);
++    auto create = reinterpret_cast<create_fn>(symbol("_create"));
++    auto destroy = reinterpret_cast<destroy_fn>(symbol("_destroy"));
++    auto prepare = reinterpret_cast<prepare_fn>(symbol("_prepare"));
++    auto run = reinterpret_cast<run_fn>(symbol("_run"));
++    auto run_prepared
++            = reinterpret_cast<run_prepared_fn>(symbol("_run_prepared"));
++    auto info = reinterpret_cast<info_fn>(symbol("_info"));
++    void *instance = create();
++    if (!instance) throw std::runtime_error("package construction failed");
++    struct instance_guard_t {
++        void *value;
++        destroy_fn destroy;
++        ~instance_guard_t() { destroy(value); }
++    } instance_guard {instance, destroy};
++    const auto runtime = info(instance);
++    if (!runtime.compatible || runtime.jit_events != 0)
++        throw std::runtime_error("package runtime reported incompatible or JIT");
++    std::string mapping;
++    if (forbidden_executable_mapping(mapping))
++        throw std::runtime_error("forbidden executable mapping: " + mapping);
++
++    std::vector<float> a(static_cast<size_t>(w.M * w.K));
++    std::vector<float> b(static_cast<size_t>(w.K * w.N));
++    std::vector<float> c(static_cast<size_t>(w.M * w.N), NAN);
++    for (size_t i = 0; i < a.size(); ++i)
++        a[i] = static_cast<float>(static_cast<int>(i % 7) - 3);
++    for (size_t i = 0; i < b.size(); ++i)
++        b[i] = static_cast<float>(static_cast<int>(i % 5) - 2);
++    for (size_t i = 0; i < a.size(); i += 4093)
++        a[i] += 0.125f;
++    for (size_t i = 0; i < b.size(); i += 4099)
++        b[i] -= 0.25f;
++    auto validate_samples = [&]() {
++        const size_t samples = std::min<size_t>(32, c.size());
++        for (size_t sample = 0; sample < samples; ++sample) {
++            const size_t index = samples == 1
++                    ? 0
++                    : sample * (c.size() - 1) / (samples - 1);
++            const size_t row = index / static_cast<size_t>(w.N);
++            const size_t col = index % static_cast<size_t>(w.N);
++            double expected = 0, magnitude = 0;
++            for (int64_t k = 0; k < w.K; ++k) {
++                const double product = static_cast<double>(
++                                               a[row * w.K + k])
++                        * b[k * w.N + col];
++                expected += product;
++                magnitude += std::fabs(product);
++            }
++            const double tolerance = 1e-6
++                    + 8 * std::numeric_limits<float>::epsilon() * magnitude;
++            if (!std::isfinite(c[index])
++                    || std::fabs(c[index] - expected) > tolerance)
++                throw std::runtime_error(
++                        "fresh-process package validation mismatch");
++        }
++    };
++    if (run(instance, a.data(), b.data(), c.data()) != 0)
++        throw std::runtime_error("package one-shot call failed");
++    validate_samples();
++    std::fill(c.begin(), c.end(), NAN);
++    if (prepare(instance, b.data()) != 0
++            || run_prepared(instance, a.data(), c.data()) != 0)
++        throw std::runtime_error("package prepared call failed");
++    validate_samples();
++    std::cout << "{\"protocol_version\":1,\"request_id\":\""
++              << json_escape(id) << "\",\"status\":\"validated\""
++              << ",\"jit_events\":0,\"runtime_warning\":"
++              << (runtime.warned ? "true" : "false") << "}\n";
++}
++
 +void usage() {
 +    std::cerr << "usage:\n"
 +              << "  matopt tune --m M --n N --k K --threads T --cpus MASK "
 +                 "--objectives LIST --history H --output O\n"
 +              << "  matopt benchmark --plan P --m M --n N --k K --threads T "
 +                 "--cpus MASK [--compare-default]\n"
-+              << "  matopt inspect --plan P\n";
++              << "  matopt inspect --plan P\n"
++              << "  matopt capture-aot --request R --bundle-dir D\n"
++              << "  matopt validate-aot --request R --package P\n";
 +}
 +} // namespace
 +
@@ -1816,6 +2462,10 @@ index 0000000000000000000000000000000000000000..ab816204e32cbb74af86c29174e6eb32
 +            baseline_command(o);
 +        else if (o.command == "evaluate")
 +            evaluate_command(o, false);
++        else if (o.command == "capture-aot")
++            capture_aot_command(o);
++        else if (o.command == "validate-aot")
++            validate_aot_command(o);
 +        else
 +            throw std::runtime_error("unknown command: " + o.command);
 +        return 0;
@@ -1827,7 +2477,7 @@ index 0000000000000000000000000000000000000000..ab816204e32cbb74af86c29174e6eb32
 +}
 diff --git a/tools/matopt/matopt_core.cpp b/tools/matopt/matopt_core.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..9a1b2e13f21b5077b1b7ef3ea5250542c8a6d81b
+index 0000000..9a1b2e1
 --- /dev/null
 +++ b/tools/matopt/matopt_core.cpp
 @@ -0,0 +1,593 @@
@@ -2426,7 +3076,7 @@ index 0000000000000000000000000000000000000000..9a1b2e13f21b5077b1b7ef3ea5250542
 +} // namespace matopt_tool
 diff --git a/tools/matopt/matopt_core.hpp b/tools/matopt/matopt_core.hpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..b80e92b1217d57832c2da181386f61e9ba3d09ba
+index 0000000..b80e92b
 --- /dev/null
 +++ b/tools/matopt/matopt_core.hpp
 @@ -0,0 +1,84 @@
@@ -2516,10 +3166,10 @@ index 0000000000000000000000000000000000000000..b80e92b1217d57832c2da181386f61e9
 +#endif
 diff --git a/tools/matopt/test_backend.cpp b/tools/matopt/test_backend.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..57add3418281b7546de4c46625ba9b7ebfa18f35
+index 0000000..dc85e79
 --- /dev/null
 +++ b/tools/matopt/test_backend.cpp
-@@ -0,0 +1,141 @@
+@@ -0,0 +1,192 @@
 +/*******************************************************************************
 +* Copyright 2026
 +* Licensed under the Apache License, Version 2.0 (the "License");
@@ -2619,6 +3269,57 @@ index 0000000000000000000000000000000000000000..57add3418281b7546de4c46625ba9b7e
 +} // namespace
 +
 +int main() {
++    namespace aot = dnnl::impl::cpu::matopt;
++    const uint8_t fake_code[] {0xc3};
++    aot::aot_begin_capture();
++    aot::aot_set_group("matmul");
++    aot::aot_record_generated("fake_main", fake_code, sizeof(fake_code));
++    aot::aot_set_group("reorder");
++    aot::aot_record_generated("fake_reorder", fake_code, sizeof(fake_code));
++    auto captured = aot::aot_end_capture();
++    if (captured.size() != 2 || captured[0].ordinal != 0
++            || captured[1].ordinal != 0) {
++        std::cerr << "AOT capture grouping failed\n";
++        return 1;
++    }
++    aot::aot_replay_image_t replay[2];
++    replay[0].group = "matmul";
++    replay[0].generator_name = "fake_main";
++    replay[0].code = fake_code;
++    replay[0].size = 1;
++    replay[1].group = "reorder";
++    replay[1].generator_name = "fake_reorder";
++    replay[1].code = fake_code;
++    replay[1].size = 1;
++    aot::aot_begin_replay(replay, 2);
++    const uint8_t *bound = nullptr;
++    size_t bound_size = 0;
++    std::string replay_error;
++    aot::aot_set_group("matmul");
++    if (!aot::aot_bind_replay(
++                "fake_main", bound, bound_size, replay_error)
++            || bound != fake_code || bound_size != 1) {
++        std::cerr << "AOT main replay binding failed\n";
++        return 1;
++    }
++    aot::aot_set_group("reorder");
++    if (!aot::aot_bind_replay(
++                "fake_reorder", bound, bound_size, replay_error)
++            || !aot::aot_end_replay(replay_error)) {
++        std::cerr << "AOT reorder replay binding failed: " << replay_error
++                  << '\n';
++        return 1;
++    }
++    aot::aot_begin_replay(replay, 2);
++    aot::aot_set_group("matmul");
++    if (!aot::aot_bind_replay(
++                "corrupt_name", bound, bound_size, replay_error)
++            || bound != nullptr) {
++        std::cerr << "AOT corrupt image did not fail closed\n";
++        return 1;
++    }
++    aot::aot_abort();
++
 +    dnnl::set_primitive_cache_capacity(0);
 +    fixture_t f;
 +    const std::vector<std::pair<pack_a_t, pack_b_t>> policies {
@@ -2663,7 +3364,7 @@ index 0000000000000000000000000000000000000000..57add3418281b7546de4c46625ba9b7e
 +}
 diff --git a/tools/matopt/test_matopt.cpp b/tools/matopt/test_matopt.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..70b5dba06450f28e66690d982f0aa931eb8a4453
+index 0000000..70b5dba
 --- /dev/null
 +++ b/tools/matopt/test_matopt.cpp
 @@ -0,0 +1,153 @@
@@ -2822,7 +3523,7 @@ index 0000000000000000000000000000000000000000..70b5dba06450f28e66690d982f0aa931
 +}
 diff --git a/tools/matopt/testdata/evaluate_avx2.json b/tools/matopt/testdata/evaluate_avx2.json
 new file mode 100644
-index 0000000000000000000000000000000000000000..2fa692c9c49a811aaed810447e3e0bf785382c91
+index 0000000..2fa692c
 --- /dev/null
 +++ b/tools/matopt/testdata/evaluate_avx2.json
 @@ -0,0 +1,39 @@

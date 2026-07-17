@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import signal
@@ -26,7 +27,12 @@ class MatOptRunner:
         if not os.path.isfile(self.executable):
             raise FileNotFoundError(self.executable)
 
-    def _run(self, command: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    def _run(
+        self,
+        command: str,
+        payload: Dict[str, Any],
+        *extra_args: str,
+    ) -> Dict[str, Any]:
         request_id = str(payload["request_id"])
         path = ""
         try:
@@ -39,7 +45,7 @@ class MatOptRunner:
             environment = os.environ.copy()
             environment.update(self.env)
             completed = subprocess.run(
-                [self.executable, command, "--request", path],
+                [self.executable, command, "--request", path, *extra_args],
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -149,4 +155,58 @@ class MatOptRunner:
             request(
                 self._id(), workload, plan=plan, expected_fingerprint=fingerprint
             ),
+        )
+
+    def capture_aot(
+        self,
+        workload: Workload,
+        plan: Dict[str, Any],
+        fingerprint: str,
+        bundle_dir: str | os.PathLike[str],
+    ) -> Dict[str, Any]:
+        """Ask a native runner to capture and link an AOT bundle.
+
+        This deliberately has no compatibility fallback.  An older runner must
+        fail export instead of silently producing a package that JITs at load or
+        construction time.
+        """
+        result = self._run(
+            "capture-aot",
+            request(
+                self._id(), workload, plan=plan, expected_fingerprint=fingerprint
+            ),
+            "--bundle-dir",
+            str(Path(bundle_dir).resolve()),
+        )
+        bundle = result.get("aot_bundle")
+        if result.get("status") == "captured" and isinstance(bundle, dict):
+            images = bundle.get("images")
+            if isinstance(images, list):
+                root = Path(bundle_dir).resolve()
+                for image in images:
+                    if not isinstance(image, dict) or not isinstance(
+                        image.get("file"), str
+                    ):
+                        continue
+                    path = (root / image["file"]).resolve()
+                    try:
+                        path.relative_to(root)
+                    except ValueError:
+                        continue
+                    if path.is_file():
+                        image["size"] = path.stat().st_size
+                        image["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+        return result
+
+    def validate_aot(
+        self,
+        workload: Workload,
+        fingerprint: str,
+        package_dir: str | os.PathLike[str],
+    ) -> Dict[str, Any]:
+        return self._run(
+            "validate-aot",
+            request(self._id(), workload, expected_fingerprint=fingerprint),
+            "--package",
+            str(Path(package_dir).resolve()),
         )

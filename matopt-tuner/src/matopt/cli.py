@@ -4,6 +4,9 @@ import argparse
 import json
 import os
 
+from .benchmark_runner import benchmark_package
+from .benchmarking import BenchmarkError
+from .exporter import ExportError, export_package
 from .protocol import MeasurementProfile, Workload
 from .reporting import ConsoleReporter
 from .runner import MatOptRunner
@@ -69,11 +72,68 @@ def parser() -> argparse.ArgumentParser:
     visualize.add_argument("--metric", choices=tuple(METRICS), default="one_shot")
     visualize.add_argument("--title")
     visualize.add_argument("--dpi", type=int, default=160)
+    export = sub.add_parser("export")
+    export.add_argument("--result", required=True)
+    export.add_argument(
+        "--objective",
+        choices=("one_shot", "steady", "throughput"),
+        required=True,
+    )
+    export.add_argument("--runner", required=True)
+    export.add_argument("--onednn-build", required=True)
+    export.add_argument("--build-dir", default="/home/weihe/tmp/matopt-aot-build")
+    export.add_argument("--output", required=True)
+    benchmark = sub.add_parser("benchmark")
+    benchmark.add_argument("--kernel", required=True)
+    benchmark.add_argument("--cpus", required=True)
+    benchmark.add_argument(
+        "--build-dir", default="/home/weihe/tmp/matopt-benchmark-build"
+    )
+    benchmark.add_argument("--output", required=True)
+    benchmark.add_argument("--fetch-google-benchmark", action="store_true")
     return root
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
+    if args.command == "benchmark":
+        try:
+            result = benchmark_package(
+                kernel=args.kernel,
+                cpus=args.cpus,
+                build_dir=args.build_dir,
+                output=args.output,
+                fetch_google_benchmark=args.fetch_google_benchmark,
+            )
+        except BenchmarkError as exc:
+            parser().error(str(exc))
+        print(
+            json.dumps(
+                {"output": result["output"], "kernel_id": result["kernel_id"]},
+                sort_keys=True,
+            )
+        )
+        return 0
+    if args.command == "export":
+        try:
+            result = export_package(
+                result_path=args.result,
+                objective=args.objective,
+                runner_path=args.runner,
+                onednn_build=args.onednn_build,
+                build_dir=args.build_dir,
+                output=args.output,
+            )
+        except ExportError as exc:
+            root = parser()
+            root.error(str(exc))
+        print(
+            json.dumps(
+                {"output": result["output"], "kernel_id": result["kernel_id"]},
+                sort_keys=True,
+            )
+        )
+        return 0
     if args.command == "visualize":
         output = plot_trajectory(
             args.history,

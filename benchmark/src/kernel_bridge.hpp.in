@@ -1,0 +1,3 @@
+#pragma once
+#include "matopt_kernel_@MATOPT_KERNEL_ID@.hpp"
+namespace matopt_benchmark_kernel = matopt::k_@MATOPT_KERNEL_ID@;
