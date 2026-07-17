@@ -13,6 +13,7 @@ from .runner import MatOptRunner
 from .search.lfbo import LFBOConfig, LFBOSearch
 from .search.random import RandomSearch
 from .space import PlanSpace, candidates
+from .space_config import SpaceConfig
 
 
 class TuningSession:
@@ -60,6 +61,7 @@ class TuningSession:
         search: Any | None = None,
         algorithm: str = "random",
         lfbo_config: LFBOConfig | None = None,
+        space_config: SpaceConfig | None = None,
         output: str | os.PathLike[str] | None = None,
     ) -> Dict[str, Any]:
         if objective not in {"one_shot", "steady", "throughput"}:
@@ -68,17 +70,38 @@ class TuningSession:
         caps = self.runner.capabilities(self.workload)
         if caps.get("status") != "capabilities":
             raise RuntimeError(f"capability discovery failed: {caps}")
-        fingerprint = str(caps["fingerprint"])
-        history = History(self.history_path, fingerprint)
-        records = history.load()
-        completed = history.completed(records)
+        runner_fingerprint = str(caps["fingerprint"])
 
         baseline_response = self.runner.baseline(
-            self.workload, measurement, fingerprint
+            self.workload, measurement, runner_fingerprint
         )
         if baseline_response.get("status") != "benchmarked":
             raise RuntimeError(f"baseline failed: {baseline_response}")
         baseline_plan = baseline_response["effective_plan"]
+        space = PlanSpace(self.workload, baseline_plan, caps, space_config)
+        space_description = space.to_dict()
+        space_hash = stable_hash(
+            {
+                "space": space_description,
+                "runner_space_capabilities": {
+                    "constraints": caps.get("constraints", {}),
+                    "domains": caps.get("domains", {}),
+                },
+            }
+        )
+        fingerprint = (
+            stable_hash(
+                {
+                    "runner_fingerprint": runner_fingerprint,
+                    "space_hash": space_hash,
+                }
+            )
+            if space_config is not None
+            else runner_fingerprint
+        )
+        history = History(self.history_path, fingerprint)
+        records = history.load()
+        completed = history.completed(records)
         baseline_hash = stable_hash(baseline_plan)
         if baseline_hash in completed:
             baseline_record = completed[baseline_hash]
@@ -100,11 +123,18 @@ class TuningSession:
         if search is None:
             if algorithm == "random":
                 search = RandomSearch(
-                    candidates(self.workload, baseline_plan, caps, budget, seed)
+                    candidates(
+                        self.workload,
+                        baseline_plan,
+                        caps,
+                        budget,
+                        seed,
+                        space_config,
+                    )
                 )
             elif algorithm == "lfbo":
                 search = LFBOSearch(
-                    PlanSpace(self.workload, baseline_plan, caps),
+                    space,
                     objective=objective,
                     budget=budget,
                     seed=seed,
@@ -149,7 +179,7 @@ class TuningSession:
                 )
             )
             response = self.runner.evaluate(
-                self.workload, plan, measurement, fingerprint
+                self.workload, plan, measurement, runner_fingerprint
             )
             state = str(response.get("status", "protocol_error"))
             record = self._record(
@@ -171,6 +201,9 @@ class TuningSession:
         result = {
             "schema_version": 1,
             "fingerprint": fingerprint,
+            "runner_fingerprint": runner_fingerprint,
+            "space_hash": space_hash,
+            "space": space_description,
             "capabilities": caps,
             "workload": self.workload.to_dict(),
             "baseline": baseline_record,

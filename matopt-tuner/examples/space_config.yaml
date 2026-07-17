@@ -1,0 +1,29 @@
+space_schema_version: 1
+inherit_baseline: true
+
+domains:
+  M_blk: {values: [64, 96, 128, 160, 192, 224, 256, 320]}
+  N_blk: {values: [32, 64]}
+  K_blk: {values: [128, 256, 512, 1024]}
+  M_chunk_size: {values: [1, 2, 4]}
+  N_chunk_size: {values: [1, 2, 4, 8]}
+  brgemm_batch_size: {values: [1, 2, 4]}
+  nthr_k:
+    values: [1, 2, 4]
+    require_capability: allow_split_k
+  pack_a: {values: [direct, per_call_padded]}
+  pack_b:
+    values: [direct, per_call_n32, per_call_n64, persistent_n32, persistent_n64]
+  bd_block: {values: [0, 4, 5, 6, 7]}
+  ld_block2: {values: [0, 2, 3, 4]}
+  loop_order: {values: [default, one-load]}
+
+conditions:
+  - if: {pack_b: [per_call_n32, persistent_n32]}
+    force: {N_blk: 32}
+  - if: {pack_b: [per_call_n64, persistent_n64]}
+    force: {N_blk: 64}
+
+limits:
+  scratchpad_per_thread_bytes: 67108864
+  minimum_parallel_work_per_thread: 0.5

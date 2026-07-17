@@ -5,6 +5,7 @@ from pathlib import Path
 from matopt.protocol import MeasurementProfile, Workload
 from matopt.search.lfbo import LFBOConfig
 from matopt.session import TuningSession
+from matopt.space_config import SpaceConfig
 
 
 PLAN = {
@@ -144,6 +145,37 @@ class SessionTests(unittest.TestCase):
                     for record in terminal
                 )
             )
+
+    def test_space_config_is_persisted_and_changes_resume_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            history = Path(directory) / "history.jsonl"
+            runner = FakeRunner()
+            session = TuningSession(
+                Workload(256, 256, 256, 1, "0"), runner, history=history
+            )
+            first_config = SpaceConfig.from_dict(
+                {"inherit_baseline": False, "domains": {"M_blk": [64, 128]}}
+            )
+            result = session.tune(
+                budget=1,
+                algorithm="random",
+                space_config=first_config,
+                measurement=MeasurementProfile(samples=1, minimum_sample_ms=1),
+            )
+            self.assertNotEqual(result["fingerprint"], result["runner_fingerprint"])
+            self.assertEqual(
+                result["space"]["requested"], first_config.to_dict()
+            )
+            second_config = SpaceConfig.from_dict(
+                {"inherit_baseline": False, "domains": {"M_blk": [64, 192]}}
+            )
+            with self.assertRaisesRegex(ValueError, "fingerprint mismatch"):
+                session.tune(
+                    budget=1,
+                    algorithm="random",
+                    space_config=second_config,
+                    measurement=MeasurementProfile(samples=1, minimum_sample_ms=1),
+                )
 
 
 if __name__ == "__main__":

@@ -7,7 +7,9 @@ name = "matopt-tuner"
 version = "0.1.0"
 description = "Out-of-tree search orchestration for the patched oneDNN MatOpt runner"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "PyYAML>=6,<7",
+]
 
 [project.optional-dependencies]
 lfbo = [

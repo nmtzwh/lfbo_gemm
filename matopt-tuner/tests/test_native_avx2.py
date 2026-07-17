@@ -7,6 +7,8 @@ from matopt.protocol import MeasurementProfile, Workload
 from matopt.runner import MatOptRunner
 from matopt.search.lfbo import LFBOConfig
 from matopt.session import TuningSession
+from matopt.space import PlanSpace
+from matopt.space_config import SpaceConfig
 
 
 @unittest.skipUnless(os.environ.get("MATOPT_RUNNER"), "MATOPT_RUNNER is not set")
@@ -67,6 +69,29 @@ class NativeAVX2Tests(unittest.TestCase):
             )
             self.assertEqual(result["search"]["algorithm"], "lfbo_pattern_search")
             self.assertIn("one_shot", result["selected"])
+
+    def test_custom_m_chunk_size_is_realized(self):
+        caps = self.runner.capabilities(self.workload)
+        baseline = self.runner.baseline(
+            self.workload, self.profile, caps["fingerprint"]
+        )
+        space = PlanSpace(
+            self.workload,
+            baseline["effective_plan"],
+            caps,
+            SpaceConfig.from_dict(
+                {
+                    "inherit_baseline": False,
+                    "domains": {"M_chunk_size": [2]},
+                }
+            ),
+        )
+        plan = space.canonicalize({"M_chunk_size": 2})
+        result = self.runner.evaluate(
+            self.workload, plan, self.profile, caps["fingerprint"]
+        )
+        self.assertEqual(result["status"], "benchmarked")
+        self.assertEqual(result["finalized"]["plan"]["M_chunk_size"], 2)
 
 
 if __name__ == "__main__":

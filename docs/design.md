@@ -114,6 +114,10 @@ replays that configuration through the explicit-plan path, validates the
 result, and benchmarks it. This baseline is never inferred from hard-coded
 defaults.
 
+See [search_space.md](search_space.md) for the detailed hierarchy of thread,
+cache, scheduler, packing, and microkernel controls; conditional constraints;
+current range rationale; and the proposed configurable-space extension.
+
 Macro candidates use:
 
 ```text

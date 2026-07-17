@@ -228,7 +228,11 @@ class LFBOSearch:
     def _generation_batch(self) -> List[Dict[str, Any]]:
         if self.generation >= self.config.generations:
             return []
-        finite = [item for item in self.observations if math.isfinite(item.loss)]
+        finite = [
+            item
+            for item in self.observations
+            if math.isfinite(item.loss) and self.space.is_allowed(item.plan)
+        ]
         if not finite:
             return self._initial_batch()
         finite.sort(key=lambda item: item.loss)

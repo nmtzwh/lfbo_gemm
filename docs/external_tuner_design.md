@@ -46,6 +46,13 @@ The standalone package now includes an LFBO Pattern Search implementation using
 NumPy and scikit-learn behind the `lfbo` optional extra. The generic external
 `ask`/`tell` adapter remains available for other optimizers.
 
+The Python package also implements a versioned YAML/JSON `SpaceConfig` passed
+with `--space-config`. It overrides selected numeric or categorical domains,
+supports baseline inheritance, conditional forcing, scratchpad and parallelism
+limits, persists the effective domains, and incorporates the effective space
+into resume identity. Runner-reported capabilities and native finalization
+remain authoritative.
+
 ## Ownership boundary
 
 ### oneDNN patch

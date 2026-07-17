@@ -8,6 +8,7 @@ from .protocol import MeasurementProfile, Workload
 from .runner import MatOptRunner
 from .search.lfbo import LFBOConfig
 from .session import TuningSession
+from .space_config import SpaceConfig
 from .visualization import METRICS, plot_trajectory
 
 
@@ -29,6 +30,10 @@ def parser() -> argparse.ArgumentParser:
     tune.add_argument("--seed", type=int, default=19260817)
     tune.add_argument("--history", required=True)
     tune.add_argument("--output", required=True)
+    tune.add_argument(
+        "--space-config",
+        help="versioned YAML or JSON file overriding the default search space",
+    )
     tune.add_argument("--timeout", type=float, default=300)
     tune.add_argument("--warmups", type=int, default=3)
     tune.add_argument("--samples", type=int, default=3)
@@ -91,6 +96,9 @@ def main(argv: list[str] | None = None) -> int:
             patience=args.lfbo_patience,
             trees=args.lfbo_trees,
             model_jobs=args.lfbo_model_jobs,
+        ),
+        space_config=(
+            SpaceConfig.load(args.space_config) if args.space_config else None
         ),
         output=args.output,
     )

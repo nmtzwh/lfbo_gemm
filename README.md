@@ -43,13 +43,16 @@ uv run matopt-tuner tune \
   --runner ../oneDNN/build/tools/matopt/matopt-runner \
   --m 256 --n 256 --k 256 \
   --threads 4 --cpus 0-3 \
+  --space-config examples/space_config.yaml \
   --objective one_shot --budget 64 \
   --history run.jsonl --output plans.json
 ```
 
 An explicit Linux CPU mask is required. See
 `docs/external_tuner_design.md` for the architecture and LFBO workflow, and
-`docs/design.md` for the audited native-backend design.
+`docs/design.md` for the audited native-backend design. The complete blocking,
+scheduling, packing, and kernel parameter space is documented in
+`docs/search_space.md`.
 
 ## Test
 
