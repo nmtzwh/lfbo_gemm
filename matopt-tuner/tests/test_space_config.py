@@ -47,6 +47,18 @@ CAPABILITIES = {
 
 
 class SpaceConfigTests(unittest.TestCase):
+    def test_explicit_domain_is_strict_by_default(self):
+        config = SpaceConfig.from_dict({"domains": {"loop_order": ["one-load"]}})
+        space = PlanSpace(
+            Workload(256, 256, 1024, 4, "0-3"),
+            BASELINE,
+            CAPABILITIES,
+            config,
+        )
+        self.assertFalse(config.inherit_baseline)
+        self.assertEqual(space.domains["loop_order"], ["one-load"])
+        self.assertFalse(space.is_allowed(BASELINE))
+
     def test_json_and_yaml_round_trip(self):
         value = {
             "space_schema_version": 1,

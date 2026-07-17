@@ -40,9 +40,10 @@ the blocking, scheduling, packing, and microkernel parameter space.
 
 Pass `--space-config FILE` to replace selected built-in domains with a
 versioned YAML or JSON `SpaceConfig`. Unspecified domains keep their built-in
-values. `inherit_baseline: true` adds the runtime oneDNN baseline value to each
-explicitly configured domain; setting it to false permits a strictly bounded
-custom domain while the baseline is still measured for comparison.
+values. Explicit domains are strictly bounded by default, while the runtime
+oneDNN baseline is still measured for comparison. Set `inherit_baseline: true`
+to add its value to each explicitly configured domain and keep an in-domain
+baseline eligible for selection.
 
 The configuration supports conditional forcing and policy-side limits for
 scratchpad and minimum parallel work. Runner capabilities remain authoritative:

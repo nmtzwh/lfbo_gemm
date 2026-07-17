@@ -148,6 +148,7 @@ def _wrapper_source(
 #include "oneapi/dnnl/dnnl.hpp"
 #include "oneapi/dnnl/dnnl_debug.h"
 #include "cpu/matmul/matopt_backend.hpp"
+#include "cpu/platform.hpp"
 
 namespace matopt = dnnl::impl::cpu::matopt;
 {declarations}
@@ -254,7 +255,7 @@ bool validate_process() {{
         throw std::runtime_error("MatOpt AOT affinity cardinality mismatch");
     if (omp_get_max_threads() != threads)
         throw std::runtime_error("MatOpt AOT OpenMP thread-count mismatch");
-    const std::string effective = dnnl_cpu_isa2str(dnnl_get_effective_cpu_isa());
+    const std::string effective = dnnl::impl::cpu::platform::get_isa_info();
     const bool isa_ok = effective.find(required_isa) != std::string::npos
             || (std::string(required_isa).find("AVX2") != std::string::npos
                     && effective.find("AVX-512") != std::string::npos);

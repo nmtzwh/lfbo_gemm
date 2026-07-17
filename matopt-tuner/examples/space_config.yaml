@@ -1,5 +1,5 @@
 space_schema_version: 1
-inherit_baseline: true
+inherit_baseline: false
 
 domains:
   M_blk: {values: [64, 96, 128, 160, 192, 224, 256, 320]}

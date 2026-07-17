@@ -80,6 +80,7 @@ class TuningSession:
             raise RuntimeError(f"baseline failed: {baseline_response}")
         baseline_plan = baseline_response["effective_plan"]
         space = PlanSpace(self.workload, baseline_plan, caps, space_config)
+        baseline_eligible = space.is_allowed(baseline_plan)
         space_description = space.to_dict()
         space_hash = stable_hash(
             {
@@ -177,6 +178,8 @@ class TuningSession:
             for record in sorted(
                 completed.values(), key=lambda item: item.get("timestamp_ns", 0)
             ):
+                if not space.is_allowed(record["plan"]):
+                    continue
                 seed_search(
                     record["plan"],
                     record.get("response", {"status": record["state"]}),
@@ -185,13 +188,20 @@ class TuningSession:
         if restore_budget is not None:
             restore_budget(sum(plan_hash != baseline_hash for plan_hash in completed))
         evaluated: List[Dict[str, Any]] = sorted(
-            completed.values(), key=lambda item: item.get("timestamp_ns", 0)
+            (
+                record
+                for record in completed.values()
+                if space.is_allowed(record["plan"])
+            ),
+            key=lambda item: item.get("timestamp_ns", 0),
         )
         for _ in range(budget):
             try:
                 plan = search.ask()
             except StopIteration:
                 break
+            if not space.is_allowed(plan):
+                raise ValueError("search proposed a plan outside the effective space")
             digest = stable_hash(plan)
             if digest in completed:
                 record = completed[digest]
@@ -228,7 +238,12 @@ class TuningSession:
                 progress("candidate", {"record": record})
 
         benchmarked = [r for r in evaluated if r.get("state") == "benchmarked"]
-        selected = select(benchmarked, objective, baseline_record)
+        selected = select(
+            benchmarked,
+            objective,
+            baseline_record,
+            baseline_eligible=baseline_eligible,
+        )
         frontier = pareto(benchmarked)
         result = {
             "schema_version": 1,

@@ -95,6 +95,17 @@ class CoreTests(unittest.TestCase):
         self.assertIs(select([base, better], "one_shot", base), better)
         noisy = record({"id": 3}, measurement(9.95, 9, 100, 10))
         self.assertIs(select([base, noisy], "one_shot", base), base)
+        self.assertIs(
+            select(
+                [noisy],
+                "one_shot",
+                base,
+                baseline_eligible=False,
+            ),
+            noisy,
+        )
+        with self.assertRaisesRegex(ValueError, "configured search space"):
+            select([], "one_shot", base, baseline_eligible=False)
 
 
 if __name__ == "__main__":

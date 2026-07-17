@@ -1065,7 +1065,7 @@ new file mode 100644
 index 0000000..a094049
 --- /dev/null
 +++ b/tools/matopt/main.cpp
-@@ -0,0 +1,1409 @@
+@@ -0,0 +1,1415 @@
 +/*******************************************************************************
 +* Copyright 2026
 +* Licensed under the Apache License, Version 2.0 (the "License");
@@ -1103,6 +1103,7 @@ index 0000000..a094049
 +
 +#include "oneapi/dnnl/dnnl.hpp"
 +#include "oneapi/dnnl/dnnl_debug.h"
++#include "cpu/platform.hpp"
 +
 +using namespace dnnl;
 +using namespace matopt_tool;
@@ -1335,16 +1336,21 @@ index 0000000..a094049
 +    const int vector_bytes = prctl(PR_SVE_GET_VL) & PR_SVE_VL_LEN_MASK;
 +    return vector_bytes > 0 ? vector_bytes * 8 : 0;
 +#else
-+    return isa.find("AVX512") != std::string::npos ? 512 : 256;
++    return isa.find("AVX512") != std::string::npos
++                    || isa.find("AVX-512") != std::string::npos
++            ? 512
++            : 256;
 +#endif
++}
++std::string effective_isa_name() {
++    return dnnl::impl::cpu::platform::get_isa_info();
 +}
 +std::string machine_identity(int threads, const std::string &mask) {
 +    const auto *v = dnnl::version();
-+    const auto isa = dnnl_get_effective_cpu_isa();
++    const std::string isa = effective_isa_name();
 +    std::ostringstream os;
 +    os << first_matching_line("/proc/cpuinfo", "model name")
-+       << ";isa=" << dnnl_cpu_isa2str(isa) << ";vector_bits="
-+       << effective_vector_bits(dnnl_cpu_isa2str(isa))
++       << ";isa=" << isa << ";vector_bits=" << effective_vector_bits(isa)
 +       << ";L1="
 +       << first_matching_line(
 +                  "/sys/devices/system/cpu/cpu0/cache/index0/size", "")
@@ -1976,7 +1982,7 @@ index 0000000..a094049
 +    std::string identity;
 +    const std::string fingerprint = fingerprint_for(w, identity);
 +    check_expected_fingerprint(request, fingerprint);
-+    const std::string isa = dnnl_cpu_isa2str(dnnl_get_effective_cpu_isa());
++    const std::string isa = effective_isa_name();
 +    std::cout << "{\"protocol_version\":1,\"request_id\":\"" << json_escape(id)
 +              << "\",\"status\":\"capabilities\"" << ",\"fingerprint\":\""
 +              << fingerprint << "\"" << ",\"identity\":\""
@@ -2269,7 +2275,7 @@ index 0000000..a094049
 +        inventory << "\"}";
 +    }
 +    inventory << ']';
-+    const std::string isa = dnnl_cpu_isa2str(dnnl_get_effective_cpu_isa());
++    const std::string isa = effective_isa_name();
 +    const int vector_bits = effective_vector_bits(isa);
 +    std::cout << "{\"protocol_version\":1,\"request_id\":\""
 +              << json_escape(id) << "\",\"status\":\"captured\""

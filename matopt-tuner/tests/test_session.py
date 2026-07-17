@@ -88,7 +88,47 @@ class OnePlanSearch:
         pass
 
 
+class SeedRecordingSearch(OnePlanSearch):
+    def __init__(self, plan):
+        super().__init__(plan)
+        self.seeds = []
+
+    def seed(self, plan, result):
+        self.seeds.append(plan)
+
+
 class SessionTests(unittest.TestCase):
+    def test_strict_space_keeps_baseline_for_comparison_only(self):
+        class SlowCandidateRunner(FakeRunner):
+            def evaluate(self, workload, plan, measurement, fingerprint):
+                self.evaluations += 1
+                return response(plan, 12)
+
+        with tempfile.TemporaryDirectory() as directory:
+            plan = dict(PLAN, loop_order="one-load")
+            search = SeedRecordingSearch(plan)
+            result = TuningSession(
+                Workload(64, 64, 64, 1, "0"),
+                SlowCandidateRunner(),
+                history=Path(directory) / "history.jsonl",
+            ).tune(
+                budget=1,
+                search=search,
+                space_config=SpaceConfig.from_dict(
+                    {"domains": {"loop_order": ["one-load"]}}
+                ),
+                measurement=MeasurementProfile(samples=1, minimum_sample_ms=1),
+            )
+            self.assertEqual(result["baseline"]["plan"]["loop_order"], "default")
+            self.assertEqual(
+                result["selected"]["one_shot"]["plan"]["loop_order"],
+                "one-load",
+            )
+            self.assertTrue(
+                all(item["plan"]["loop_order"] == "one-load" for item in result["pareto"])
+            )
+            self.assertEqual(search.seeds, [])
+
     def test_progress_events_cover_runtime_lifecycle(self):
         with tempfile.TemporaryDirectory() as directory:
             events = []

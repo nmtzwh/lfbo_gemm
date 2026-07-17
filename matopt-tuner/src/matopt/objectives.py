@@ -44,7 +44,11 @@ def pareto(records: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def select(
-    records: List[Dict[str, Any]], objective: str, baseline: Dict[str, Any]
+    records: List[Dict[str, Any]],
+    objective: str,
+    baseline: Dict[str, Any],
+    *,
+    baseline_eligible: bool = True,
 ) -> Dict[str, Any]:
     valid = [
         r
@@ -54,7 +58,9 @@ def select(
         and _measurement(r).get("stable")
     ]
     if not valid:
-        return baseline
+        if baseline_eligible:
+            return baseline
+        raise ValueError("no correct stable result within configured search space")
     if objective == "throughput":
         best = max(valid, key=lambda r: _measurement(r)["throughput_gflops"])
         gain = (
@@ -72,5 +78,4 @@ def select(
         (base_m["p90_ms"] - base_m["median_ms"])
         / max(base_m["median_ms"], 1e-30),
     )
-    return best if gain > max(0.01, noise) else baseline
-
+    return best if not baseline_eligible or gain > max(0.01, noise) else baseline

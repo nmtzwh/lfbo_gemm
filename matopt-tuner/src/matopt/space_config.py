@@ -61,7 +61,7 @@ class ConditionConfig:
 @dataclass(frozen=True)
 class SpaceConfig:
     schema_version: int = SPACE_SCHEMA_VERSION
-    inherit_baseline: bool = True
+    inherit_baseline: bool = False
     domains: Dict[str, DomainConfig] = field(default_factory=dict)
     conditions: tuple[ConditionConfig, ...] = ()
     limits: Dict[str, float | int] = field(default_factory=dict)
@@ -100,7 +100,7 @@ class SpaceConfig:
         version = value.get("space_schema_version", SPACE_SCHEMA_VERSION)
         if version != SPACE_SCHEMA_VERSION:
             raise ValueError(f"unsupported SpaceConfig schema version: {version}")
-        inherit = value.get("inherit_baseline", True)
+        inherit = value.get("inherit_baseline", False)
         if not isinstance(inherit, bool):
             raise ValueError("inherit_baseline must be a boolean")
 

@@ -424,8 +424,9 @@ without duplicating backend-private validation in Python.
 
 The MVP search space follows five principles:
 
-1. **Retain the runtime baseline.** Hard-coded domains supplement rather than
-   replace oneDNN's architecture and shape heuristics.
+1. **Retain the runtime baseline as evidence.** The oneDNN heuristic is always
+   measured for comparison. It remains eligible in the built-in space, while
+   an explicit strict domain may exclude it from search and selection.
 2. **Expose controls with large expected effects.** Macro blocks, packing,
    spatial chunking, split-K, and register tiles materially change reuse,
    parallelism, or data movement.
@@ -446,7 +447,7 @@ runner capabilities as an upper bound:
 
 ```yaml
 space_schema_version: 1
-inherit_baseline: true
+inherit_baseline: false
 domains:
   M_blk: {values: [64, 96, 128, 160, 192, 224, 256, 320]}
   N_blk: {values: [32, 64]}
@@ -479,11 +480,13 @@ matopt-tuner tune ... --space-config examples/space_config.yaml
 ```
 
 Configured domains replace the built-in list for that field; unspecified
-fields retain their built-in domains. With `inherit_baseline: true`, the
-runtime baseline value is added to every explicitly configured domain. Values
-larger than M/N/K, non-divisors of the requested thread count, and BRGEMM batch
-sizes that cannot fit any configured K block are removed during construction.
-An empty effective domain is an error.
+fields retain their built-in domains. Explicit domains are strict by default:
+an out-of-domain runtime baseline remains in the report as a comparison, but
+does not seed the optimizer, enter the Pareto set, or remain eligible for final
+selection. With `inherit_baseline: true`, its value is added to every explicitly
+configured domain. Values larger than M/N/K, non-divisors of the requested
+thread count, and BRGEMM batch sizes that cannot fit any configured K block are
+removed during construction. An empty effective domain is an error.
 
 The runner-reported categorical and microtile domains are hard upper bounds.
 `scratchpad_per_thread_bytes` may only narrow the runner's limit.
