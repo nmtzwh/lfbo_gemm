@@ -1,9 +1,12 @@
 import os
+import json
+import subprocess
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
-from matopt.protocol import MeasurementProfile, Workload
+from matopt.protocol import MeasurementProfile, Workload, canonical_json, request
 from matopt.runner import MatOptRunner
 from matopt.search.lfbo import LFBOConfig
 from matopt.session import TuningSession
@@ -126,6 +129,59 @@ class NativeAVX2Tests(unittest.TestCase):
                 "reorder",
                 {image["group"] for image in captured["aot_bundle"]["images"]},
             )
+
+    def test_perf_diag_trace_and_control_window(self):
+        caps = self.runner.capabilities(self.workload)
+        baseline = self.runner.baseline(
+            self.workload, self.profile, caps["fingerprint"]
+        )
+        payload = request(
+            "native-perf-diag", self.workload,
+            plan=baseline["effective_plan"],
+            expected_fingerprint=caps["fingerprint"],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            request_path = Path(directory) / "request.json"
+            request_path.write_text(canonical_json(payload), encoding="utf-8")
+            control_read, control_write = os.pipe()
+            ack_read, ack_write = os.pipe()
+            commands = []
+
+            def acknowledge():
+                with os.fdopen(control_read, "r", encoding="ascii") as control:
+                    for line in control:
+                        commands.append(line.strip())
+                        os.write(ack_write, b"ack\n")
+                        if line.strip() == "disable":
+                            break
+
+            thread = threading.Thread(target=acknowledge)
+            thread.start()
+            completed = subprocess.run(
+                [
+                    self.runner.executable, "perf-diag",
+                    "--request", str(request_path), "--stage", "full_driver",
+                    "--perf-control-fd", str(control_write),
+                    "--perf-ack-fd", str(ack_read),
+                ],
+                text=True, capture_output=True, check=False,
+                pass_fds=(control_write, ack_read),
+                env={**os.environ, "ONEDNN_MAX_CPU_ISA": "AVX2"},
+            )
+            os.close(control_write)
+            os.close(ack_read)
+            thread.join()
+            os.close(ack_write)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        response = json.loads(completed.stdout)
+        self.assertEqual(commands, ["enable", "disable"])
+        self.assertEqual(response["status"], "diagnosed")
+        self.assertEqual(response["trace"]["fidelity"], "exact_worker_trace")
+        self.assertEqual(
+            response["trace"]["flops"],
+            2 * self.workload.m * self.workload.n * self.workload.k,
+        )
+        self.assertTrue(response["trace"]["entries"])
 
 
 if __name__ == "__main__":

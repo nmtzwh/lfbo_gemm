@@ -1,0 +1,20 @@
+schema: perf_diag_profile_v1
+architecture: x86_64
+cpu_model_regex: '.*'
+isa: AVX2
+vector_bits: 256
+homogeneous_cores: true
+fp32_flops_per_cycle_per_core: 16
+events:
+  cycles: cycles
+  task_clock: task-clock
+  instructions: instructions
+  l1_accesses: L1-dcache-loads
+  l1_refills: L1-dcache-load-misses
+  l2_accesses: l2_rqsts.references
+  l2_refills: l2_rqsts.miss
+  llc_accesses: LLC-loads
+  llc_refills: LLC-load-misses
+  memory_stall_cycles: cycle_activity.stalls_mem_any
+  context_switches: context-switches
+  cpu_migrations: cpu-migrations

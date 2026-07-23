@@ -210,3 +210,99 @@ class MatOptRunner:
             "--package",
             str(Path(package_dir).resolve()),
         )
+
+    def perf_diagnose_stage(
+        self,
+        workload: Workload,
+        plan: Dict[str, Any],
+        fingerprint: str,
+        stage: str,
+        events: Mapping[str, str],
+    ) -> Dict[str, Any]:
+        """Run each semantic PMU role in a non-multiplexed controlled pass."""
+        from .perf_diag import parse_perf_csv
+
+        payload = request(
+            self._id(), workload, plan=plan, expected_fingerprint=fingerprint
+        )
+        aggregate: Dict[str, Any] = {}
+        representative: Dict[str, Any] | None = None
+        timings: list[float] = []
+        for role, event in events.items():
+            request_id = str(payload["request_id"])
+            path = ""
+            control_read = control_write = ack_read = ack_write = -1
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w", encoding="utf-8", suffix=".json", delete=False
+                ) as stream:
+                    path = stream.name
+                    stream.write(canonical_json(payload))
+                    stream.write("\n")
+                control_read, control_write = os.pipe()
+                ack_read, ack_write = os.pipe()
+                environment = os.environ.copy()
+                environment.update(self.env)
+                command = [
+                    "perf", "stat", "-x", ";", "--no-big-num", "--delay=-1",
+                    "--control", f"fd:{control_read},{ack_write}",
+                    "-e", event, "--", self.executable, "perf-diag",
+                    "--request", path, "--stage", stage,
+                    "--perf-control-fd", str(control_write),
+                    "--perf-ack-fd", str(ack_read),
+                ]
+                completed = subprocess.run(
+                    command, text=True, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, timeout=self.timeout,
+                    env=environment,
+                    pass_fds=(control_read, control_write, ack_read, ack_write),
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                return {"protocol_version": 1, "request_id": request_id,
+                        "status": "timed_out", "detail": str(exc)}
+            finally:
+                for fd in (control_read, control_write, ack_read, ack_write):
+                    if fd >= 0:
+                        try:
+                            os.close(fd)
+                        except OSError:
+                            pass
+                if path:
+                    try:
+                        os.unlink(path)
+                    except FileNotFoundError:
+                        pass
+            if completed.returncode != 0:
+                return {"protocol_version": 1, "request_id": request_id,
+                        "status": "runner_error",
+                        "exit_code": completed.returncode,
+                        "stderr": completed.stderr}
+            lines = [line for line in completed.stdout.splitlines() if line.strip()]
+            if len(lines) != 1:
+                return {"protocol_version": 1, "request_id": request_id,
+                        "status": "protocol_error",
+                        "detail": "runner stdout must contain one JSON object",
+                        "stdout": completed.stdout, "stderr": completed.stderr}
+            try:
+                response = validate_response(json.loads(lines[0]), request_id)
+            except (json.JSONDecodeError, ValueError) as exc:
+                return {"protocol_version": 1, "request_id": request_id,
+                        "status": "protocol_error", "detail": str(exc)}
+            if representative is None:
+                representative = response
+            samples = response.get("samples_ms")
+            if isinstance(samples, list):
+                timings.append(float(sorted(samples)[len(samples) // 2]))
+            parsed = parse_perf_csv(completed.stderr, {event: role})
+            aggregate.update(parsed)
+        if representative is None:
+            return {"protocol_version": 1, "request_id": str(payload["request_id"]),
+                    "status": "protocol_error", "detail": "empty PMU event set"}
+        representative["pmu"] = aggregate
+        if timings:
+            representative["counter_pass_medians_ms"] = timings
+            drift = (max(timings) - min(timings)) / max(
+                sorted(timings)[len(timings) // 2], 1e-12)
+            representative["counter_pass_timing_drift"] = drift
+        return representative

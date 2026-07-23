@@ -76,6 +76,23 @@ also disables automatic color.
 Verbose diagnostics never go to stdout, so scripts may continue parsing the
 final JSON response unchanged.
 
+## Performance diagnosis
+
+On a pinned target host with PMU access, diagnose a correct, stable selected
+record with:
+
+```bash
+uv run matopt-tuner diagnose \
+  --result plans.json --objective throughput \
+  --runner /path/to/matopt-runner \
+  --pmu-profile examples/perf_diag_profile_v1.yaml \
+  --nominal-peak-gflops 6400 --output perf-diag-report
+```
+
+The example profile demonstrates the schema only; replace its event mappings
+with a profile validated for the target CPU. See `../docs/perf_diag.md` for the
+counter-window, report, and fail-closed attribution contracts.
+
 ## AOT commands
 
 `matopt-tuner export` consumes a selected tuning result and enforces the

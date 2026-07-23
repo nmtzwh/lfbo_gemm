@@ -7,6 +7,7 @@ import os
 from .benchmark_runner import benchmark_package
 from .benchmarking import BenchmarkError
 from .exporter import ExportError, export_package
+from .perf_diag import PerfDiagError, diagnose
 from .protocol import MeasurementProfile, Workload
 from .reporting import ConsoleReporter
 from .runner import MatOptRunner
@@ -91,11 +92,41 @@ def parser() -> argparse.ArgumentParser:
     )
     benchmark.add_argument("--output", required=True)
     benchmark.add_argument("--fetch-google-benchmark", action="store_true")
+    diagnostic = sub.add_parser("diagnose")
+    diagnostic.add_argument("--result", required=True)
+    diagnostic.add_argument(
+        "--objective",
+        choices=("one_shot", "steady", "throughput"),
+        required=True,
+    )
+    diagnostic.add_argument("--runner", required=True)
+    diagnostic.add_argument("--pmu-profile", required=True)
+    diagnostic.add_argument("--nominal-peak-gflops", required=True, type=float)
+    diagnostic.add_argument("--output", required=True)
+    diagnostic.add_argument("--kernel")
+    diagnostic.add_argument("--timeout", type=float, default=300)
     return root
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
+    if args.command == "diagnose":
+        try:
+            result = diagnose(
+                result_path=args.result,
+                objective=args.objective,
+                runner_path=args.runner,
+                profile_path=args.pmu_profile,
+                nominal_peak_gflops=args.nominal_peak_gflops,
+                output=args.output,
+                kernel=args.kernel,
+                timeout=args.timeout,
+            )
+        except PerfDiagError as exc:
+            root = parser()
+            root.error(str(exc))
+        print(json.dumps(result, sort_keys=True))
+        return 0 if result["status"] == "authoritative" else 1
     if args.command == "benchmark":
         try:
             result = benchmark_package(

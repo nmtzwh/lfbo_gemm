@@ -180,7 +180,7 @@ index c0efc1f..0f89c3f 100644
      }
  
 diff --git a/src/cpu/aarch64/matmul/brgemm_matmul.cpp b/src/cpu/aarch64/matmul/brgemm_matmul.cpp
-index bfc4187..485309a 100644
+index bfc4187..4cdedff 100644
 --- a/src/cpu/aarch64/matmul/brgemm_matmul.cpp
 +++ b/src/cpu/aarch64/matmul/brgemm_matmul.cpp
 @@ -28,6 +28,9 @@
@@ -222,6 +222,30 @@ index bfc4187..485309a 100644
  
          bgmmc_.wsp_tile_per_thr_bytes = nstl::max(
                  brg.get_wsp_buffer_size(), bgmmc_.wsp_tile_per_thr_bytes);
+@@ -415,6 +436,11 @@ void brgemm_matmul_t<isa>::compute_kernel(
+         brgmm_ctx.copy_dst_values_to_buffer(b_idx, m_blk_idx, n_blk_idx);
+ 
+     if (gemm_batch > 0 && brg_ker_idx >= 0) {
++        matopt::perf_trace_record(ithr, brg_ker_idx,
++                static_cast<int>(nstl::min<dim_t>(bgmmc.M_blk, M - m)),
++                static_cast<int>(
++                        nstl::min<dim_t>(bgmmc.N_blk, bgmmc.N - n)),
++                gemm_batch * bgmmc.K_blk, gemm_batch);
+         const auto brg_kernel = brg_kernels_[brg_ker_idx].get();
+         assert(brg_kernel != nullptr);
+ 
+@@ -463,6 +489,11 @@ void brgemm_matmul_t<isa>::compute_kernel(
+                 false, use_init_ker, m_ker_idx, is_N_tail, true);
+         assert(brg_ker_idx >= 0);
+         const auto brg_kernel_k_tail = brg_kernels_[brg_ker_idx].get();
++        matopt::perf_trace_record(ithr, brg_ker_idx,
++                static_cast<int>(nstl::min<dim_t>(bgmmc.M_blk, M - m)),
++                static_cast<int>(
++                        nstl::min<dim_t>(bgmmc.N_blk, bgmmc.N - n)),
++                bgmmc.K_tail, 1);
+ 
+         if (post_ops_applicable) {
+             void *scratch = static_cast<void *>(
 diff --git a/src/cpu/aarch64/matmul/brgemm_matmul_copy_utils.cpp b/src/cpu/aarch64/matmul/brgemm_matmul_copy_utils.cpp
 index 805a471..923565c 100644
 --- a/src/cpu/aarch64/matmul/brgemm_matmul_copy_utils.cpp
@@ -319,210 +343,12 @@ index 87aabed..a436a02 100644
  
      return status::success;
  }
-diff --git a/src/cpu/x64/brgemm/brgemm_utils.cpp b/src/cpu/x64/brgemm/brgemm_utils.cpp
-index 1dfeedd..da0991c 100644
---- a/src/cpu/x64/brgemm/brgemm_utils.cpp
-+++ b/src/cpu/x64/brgemm/brgemm_utils.cpp
-@@ -768,7 +768,11 @@ status_t brgemm_blocking_vmm(brgemm_desc_t *brg) {
-     bool few_regs = utils::one_of(brg->isa_impl, avx2, avx2_vnni, avx2_vnni_2);
-     bool hint_n_bcast_1_load
-             = brg->brgattr.hint_loop_order == brgemm_lo_bl_1load;
--    for (int try_ld_block2 = 4; try_ld_block2 > 0; --try_ld_block2) {
-+    const int requested_ld_block2 = brg->brgattr.hint_ld_block2;
-+    if (requested_ld_block2 < 0 || requested_ld_block2 > 4)
-+        return status::invalid_arguments;
-+    for (int try_ld_block2 = requested_ld_block2 ? requested_ld_block2 : 4;
-+            try_ld_block2 > 0; --try_ld_block2) {
-         adj_ld_block2 = calculate_ldb_params(brg, try_ld_block2);
-         brg->n_bcast_1_load
-                 = (few_regs && adj_ld_block2 == 4) || hint_n_bcast_1_load;
-@@ -776,6 +780,7 @@ status_t brgemm_blocking_vmm(brgemm_desc_t *brg) {
-         const auto bdb_tail = brg->bcast_dim % max_bcast_block;
-         min_bcast_block = bdb_tail > 0 ? bdb_tail : max_bcast_block;
-         if (min_bcast_block >= max_vpad) break;
-+        if (requested_ld_block2) return status::invalid_arguments;
-     }
-     // bcast block in brgemm kernel should be greater than virtual
-     // padding to avoid possible functional issues
-@@ -783,9 +788,17 @@ status_t brgemm_blocking_vmm(brgemm_desc_t *brg) {
- 
-     const int min_block = nstl::max(1, max_vpad);
- 
-+    const int requested_bd_block = brg->brgattr.hint_bd_block;
-+    if (requested_bd_block < 0 || requested_bd_block > max_bcast_block
-+            || requested_bd_block > brg->bcast_dim)
-+        return status::invalid_arguments;
-+
-     float best_bd_block_eff = 0.f;
--    brg->bd_block = max_bcast_block;
--    for (int bd_block = max_bcast_block; bd_block >= min_block; bd_block--) {
-+    brg->bd_block = requested_bd_block ? requested_bd_block : max_bcast_block;
-+    for (int bd_block
-+            = requested_bd_block ? requested_bd_block : max_bcast_block;
-+            bd_block >= (requested_bd_block ? requested_bd_block : min_block);
-+            bd_block--) {
-         // avoid msvc warning 'potential divide by zero'
-         const auto bd_block_disb = (brg->bcast_dim <= 0 || bd_block == 0)
-                 ? 0.f
-@@ -804,6 +817,8 @@ status_t brgemm_blocking_vmm(brgemm_desc_t *brg) {
-             best_bd_block_eff = bd_block_eff;
-         }
-     }
-+    if (requested_bd_block && best_bd_block_eff == 0.f)
-+        return status::invalid_arguments;
-     brg->bdb = brg->bcast_dim / brg->bd_block;
-     brg->bdb_tail = brg->bcast_dim % brg->bd_block;
- 
-diff --git a/src/cpu/x64/jit_generator.hpp b/src/cpu/x64/jit_generator.hpp
-index 4e6bb4d..f655bc5 100644
---- a/src/cpu/x64/jit_generator.hpp
-+++ b/src/cpu/x64/jit_generator.hpp
-@@ -28,6 +28,9 @@
- #include "cpu/x64/cpu_isa_traits.hpp"
- 
- #include "cpu/jit_utils/jit_utils.hpp"
-+#ifdef DNNL_BUILD_MATOPT
-+#include "cpu/matmul/matopt_backend.hpp"
-+#endif
- 
- #if defined(_WIN32) && !defined(__GNUC__)
- #define STRUCT_ALIGN(al, ...) __declspec(align(al)) __VA_ARGS__
-@@ -2752,9 +2755,18 @@ public:
- 
-     /* All uni_ instructions -- apart from uni_vzeroupper() -- will comply with
-      * the max_cpu_isa argument */
-+    static void *matopt_code_buffer() {
-+#ifdef DNNL_BUILD_MATOPT
-+        size_t size = 0;
-+        const uint8_t *code = matopt::aot_replay_buffer(size);
-+        if (code) return const_cast<uint8_t *>(code);
-+#endif
-+        return Xbyak::AutoGrow;
-+    }
-+
-     jit_generator_t(const char *name, cpu_isa_t max_cpu_isa = get_max_cpu_isa())
-         : Xbyak::MmapAllocator(name)
--        , Xbyak::CodeGenerator(max_code_size, Xbyak::AutoGrow,
-+        , Xbyak::CodeGenerator(max_code_size, matopt_code_buffer(),
-                   /*allocator=*/this)
-         , max_cpu_isa_(max_cpu_isa) {}
- 
-@@ -2777,11 +2789,29 @@ public:
-     }
- 
-     virtual status_t create_kernel() {
-+#ifdef DNNL_BUILD_MATOPT
-+        const uint8_t *replay_code = nullptr;
-+        size_t replay_size = 0;
-+        std::string replay_error;
-+        if (matopt::aot_bind_replay(
-+                    name(), replay_code, replay_size, replay_error)) {
-+            if (!replay_code) {
-+                matopt::set_error(replay_error);
-+                return status::runtime_error;
-+            }
-+            jit_ker_ = replay_code;
-+            return status::success;
-+        }
-+#endif
-         int err_code = Xbyak::GetError();
-         if (err_code == Xbyak::ERR_CANT_ALLOC) return status::out_of_memory;
-         if (err_code != Xbyak::ERR_NONE) return status::runtime_error;
-         generate();
-         jit_ker_ = getCode();
-+#ifdef DNNL_BUILD_MATOPT
-+        if (jit_ker_)
-+            matopt::aot_record_generated(name(), jit_ker_, getSize());
-+#endif
-         return (jit_ker_) ? status::success : status::runtime_error;
-     }
- 
-diff --git a/src/cpu/x64/matmul/brgemm_matmul.cpp b/src/cpu/x64/matmul/brgemm_matmul.cpp
-index e42a436..2f78bbb 100644
---- a/src/cpu/x64/matmul/brgemm_matmul.cpp
-+++ b/src/cpu/x64/matmul/brgemm_matmul.cpp
-@@ -28,6 +28,9 @@
- #include "cpu/x64/amx_tile_configure.hpp"
- #include "cpu/x64/injectors/jit_uni_binary_injector.hpp"
- #include "cpu/x64/matmul/brgemm_matmul.hpp"
-+#if DNNL_BUILD_MATOPT
-+#include "cpu/matmul/matopt_backend.hpp"
-+#endif
- 
- // This is required to implement `can_use_gemm_fallback`.
- #include "cpu/matmul/gemm_bf16_matmul.hpp"
-@@ -412,6 +415,19 @@ status_t brgemm_matmul_t<isa>::pd_t::init(engine_t *engine) {
-         brgattr.mem_advice = bgmmc_.mem_advice;
-         brgattr.max_bs = bs;
-         brgattr.hint_prefetchw = bgmmc_.hint_prefetchw;
-+#if DNNL_BUILD_MATOPT
-+        const auto *matopt_plan = matopt::active_plan();
-+        const bool matopt_full_desc
-+                = i_bs == 0 && i_M == 0 && i_N == 0 && i_K == 0;
-+        if (matopt_plan && matopt_full_desc) {
-+            brgattr.hint_bd_block = matopt_plan->bd_block;
-+            brgattr.hint_ld_block2 = matopt_plan->ld_block2;
-+            brgattr.hint_loop_order
-+                    = matopt_plan->loop_order == matopt::loop_order_t::one_load
-+                    ? brgemm_lo_bl_1load
-+                    : brgemm_lo_default;
-+        }
-+#endif
-         if (is_superset(kernel_isa, avx512_core_amx)) {
-             brgattr.use_uker = true;
-             brgattr.use_interleave_stores = true;
-@@ -443,6 +459,11 @@ status_t brgemm_matmul_t<isa>::pd_t::init(engine_t *engine) {
- 
-         CHECK(brgemm_desc_set_attr(&brg, brgattr));
-         CHECK(brgemm_desc_finalize(&brg));
-+#if DNNL_BUILD_MATOPT
-+        if (i_bs == 0 && i_M == 0 && i_N == 0 && i_K == 0)
-+            matopt::capture_microtile(
-+                    brg.bd_block, brg.ld_block2, brg.get_wsp_buffer_size());
-+#endif
- 
-         bgmmc_.wsp_tile_per_thr_bytes = nstl::max(
-                 brg.get_wsp_buffer_size(), bgmmc_.wsp_tile_per_thr_bytes);
-diff --git a/src/cpu/x64/matmul/brgemm_matmul_utils.cpp b/src/cpu/x64/matmul/brgemm_matmul_utils.cpp
-index 9996347..b69a376 100644
---- a/src/cpu/x64/matmul/brgemm_matmul_utils.cpp
-+++ b/src/cpu/x64/matmul/brgemm_matmul_utils.cpp
-@@ -24,6 +24,9 @@
- #include "cpu/x64/injectors/jit_uni_postops_injector.hpp"
- #include "cpu/x64/matmul/amx_blocking_heuristics.hpp"
- #include "cpu/x64/matmul/brgemm_matmul_utils.hpp"
-+#if DNNL_BUILD_MATOPT
-+#include "cpu/matmul/matopt_backend.hpp"
-+#endif
- #include "cpu/x64/matmul/postops_estimator.hpp"
- #include "oneapi/dnnl/dnnl_debug.h"
- 
-@@ -1814,6 +1817,9 @@ status_t init_brgemm_matmul_conf(cpu_isa_t isa, brgemm_matmul_conf_t &bgmmc,
-     // - nthr_K
-     VCHECK_BG(compute_blocking_heuristic(bgmmc, bm_conf_utils),
-             VERBOSE_BLOCKING_FAIL, "");
-+#if DNNL_BUILD_MATOPT
-+    VCHECK_BG(matopt::apply_plan(bgmmc), VERBOSE_BLOCKING_FAIL, "");
-+#endif
- 
-     if (bgmmc.wei_n_blk > bgmmc.N_blk && bgmmc.N != bgmmc.N_blk) {
-         assert(!bgmmc.is_runtime_N
-@@ -1877,6 +1883,9 @@ status_t init_brgemm_matmul_conf(cpu_isa_t isa, brgemm_matmul_conf_t &bgmmc,
- 
-     // Sets things related to chunks and others
-     init_aux_values(bgmmc, src_d, weights_d, dst_d);
-+#if DNNL_BUILD_MATOPT
-+    matopt::capture(bgmmc);
-+#endif
- 
-     const bool need_store_prfw = bgmmc.N <= 14528
-             && ((bgmmc.M <= 768 && bgmmc.K <= 128)
 diff --git a/src/cpu/matmul/matopt_backend.cpp b/src/cpu/matmul/matopt_backend.cpp
 new file mode 100644
-index 0000000..b092834
+index 0000000..a397a20
 --- /dev/null
 +++ b/src/cpu/matmul/matopt_backend.cpp
-@@ -0,0 +1,210 @@
+@@ -0,0 +1,244 @@
 +/*******************************************************************************
 +* Copyright 2026
 +*
@@ -532,6 +358,8 @@ index 0000000..b092834
 +#include "cpu/matmul/matopt_backend.hpp"
 +
 +#include <map>
++#include <atomic>
++#include <mutex>
 +#include <stdexcept>
 +#include <utility>
 +
@@ -540,11 +368,16 @@ index 0000000..b092834
 +namespace cpu {
 +namespace matopt {
 +
++std::atomic<bool> perf_trace_enabled {false};
++
 +namespace {
 +thread_local const plan_t *current_plan = nullptr;
 +thread_local finalized_plan_t captured;
 +thread_local bool captured_valid = false;
 +thread_local std::string last_error;
++std::mutex trace_mutex;
++std::vector<perf_trace_entry_t> trace_entries;
++std::map<int, uint64_t> trace_worker_order;
 +
 +struct aot_state_t {
 +    aot_mode_t mode = aot_mode_t::disabled;
@@ -729,16 +562,43 @@ index 0000000..b092834
 +        captured.scratchpad_bytes = scratchpad_bytes;
 +}
 +
++void perf_trace_begin() {
++    std::lock_guard<std::mutex> lock(trace_mutex);
++    trace_entries.clear();
++    trace_worker_order.clear();
++    perf_trace_enabled.store(true, std::memory_order_release);
++}
++
++std::vector<perf_trace_entry_t> perf_trace_end() {
++    perf_trace_enabled.store(false, std::memory_order_release);
++    std::lock_guard<std::mutex> lock(trace_mutex);
++    return trace_entries;
++}
++
++void perf_trace_record_active(
++        int worker, int variant, int m, int n, int k, int batch) {
++    perf_trace_entry_t entry;
++    entry.worker = worker;
++    entry.variant = variant;
++    entry.m = m;
++    entry.n = n;
++    entry.k = k;
++    entry.batch = batch;
++    std::lock_guard<std::mutex> lock(trace_mutex);
++    entry.order = trace_worker_order[worker]++;
++    trace_entries.push_back(entry);
++}
++
 +} // namespace matopt
 +} // namespace cpu
 +} // namespace impl
 +} // namespace dnnl
 diff --git a/src/cpu/matmul/matopt_backend.hpp b/src/cpu/matmul/matopt_backend.hpp
 new file mode 100644
-index 0000000..d9eb7da
+index 0000000..5376fad
 --- /dev/null
 +++ b/src/cpu/matmul/matopt_backend.hpp
-@@ -0,0 +1,239 @@
+@@ -0,0 +1,263 @@
 +/*******************************************************************************
 +* Copyright 2026
 +*
@@ -749,6 +609,8 @@ index 0000000..d9eb7da
 +#define CPU_MATMUL_MATOPT_BACKEND_HPP
 +
 +#include <cstdint>
++#include <cstddef>
++#include <atomic>
 +#include <string>
 +#include <vector>
 +
@@ -972,6 +834,28 @@ index 0000000..d9eb7da
 +
 +void capture_microtile(int bd_block, int ld_block2, size_t scratchpad_bytes);
 +
++struct perf_trace_entry_t {
++    int worker = 0;
++    int variant = 0;
++    int m = 0, n = 0, k = 0;
++    int batch = 0;
++    uint64_t order = 0;
++};
++
++void perf_trace_begin();
++std::vector<perf_trace_entry_t> perf_trace_end();
++extern std::atomic<bool> perf_trace_enabled;
++inline bool perf_trace_active() {
++    return perf_trace_enabled.load(std::memory_order_relaxed);
++}
++void perf_trace_record_active(
++        int worker, int variant, int m, int n, int k, int batch);
++inline void perf_trace_record(
++        int worker, int variant, int m, int n, int k, int batch) {
++    if (perf_trace_active())
++        perf_trace_record_active(worker, variant, m, n, k, batch);
++}
++
 +} // namespace matopt
 +} // namespace cpu
 +} // namespace impl
@@ -1028,6 +912,236 @@ index 0000000..fd6cc68
 +} // namespace dnnl
 +
 +#endif
+diff --git a/src/cpu/x64/brgemm/brgemm_utils.cpp b/src/cpu/x64/brgemm/brgemm_utils.cpp
+index 1dfeedd..da0991c 100644
+--- a/src/cpu/x64/brgemm/brgemm_utils.cpp
++++ b/src/cpu/x64/brgemm/brgemm_utils.cpp
+@@ -768,7 +768,11 @@ status_t brgemm_blocking_vmm(brgemm_desc_t *brg) {
+     bool few_regs = utils::one_of(brg->isa_impl, avx2, avx2_vnni, avx2_vnni_2);
+     bool hint_n_bcast_1_load
+             = brg->brgattr.hint_loop_order == brgemm_lo_bl_1load;
+-    for (int try_ld_block2 = 4; try_ld_block2 > 0; --try_ld_block2) {
++    const int requested_ld_block2 = brg->brgattr.hint_ld_block2;
++    if (requested_ld_block2 < 0 || requested_ld_block2 > 4)
++        return status::invalid_arguments;
++    for (int try_ld_block2 = requested_ld_block2 ? requested_ld_block2 : 4;
++            try_ld_block2 > 0; --try_ld_block2) {
+         adj_ld_block2 = calculate_ldb_params(brg, try_ld_block2);
+         brg->n_bcast_1_load
+                 = (few_regs && adj_ld_block2 == 4) || hint_n_bcast_1_load;
+@@ -776,6 +780,7 @@ status_t brgemm_blocking_vmm(brgemm_desc_t *brg) {
+         const auto bdb_tail = brg->bcast_dim % max_bcast_block;
+         min_bcast_block = bdb_tail > 0 ? bdb_tail : max_bcast_block;
+         if (min_bcast_block >= max_vpad) break;
++        if (requested_ld_block2) return status::invalid_arguments;
+     }
+     // bcast block in brgemm kernel should be greater than virtual
+     // padding to avoid possible functional issues
+@@ -783,9 +788,17 @@ status_t brgemm_blocking_vmm(brgemm_desc_t *brg) {
+ 
+     const int min_block = nstl::max(1, max_vpad);
+ 
++    const int requested_bd_block = brg->brgattr.hint_bd_block;
++    if (requested_bd_block < 0 || requested_bd_block > max_bcast_block
++            || requested_bd_block > brg->bcast_dim)
++        return status::invalid_arguments;
++
+     float best_bd_block_eff = 0.f;
+-    brg->bd_block = max_bcast_block;
+-    for (int bd_block = max_bcast_block; bd_block >= min_block; bd_block--) {
++    brg->bd_block = requested_bd_block ? requested_bd_block : max_bcast_block;
++    for (int bd_block
++            = requested_bd_block ? requested_bd_block : max_bcast_block;
++            bd_block >= (requested_bd_block ? requested_bd_block : min_block);
++            bd_block--) {
+         // avoid msvc warning 'potential divide by zero'
+         const auto bd_block_disb = (brg->bcast_dim <= 0 || bd_block == 0)
+                 ? 0.f
+@@ -804,6 +817,8 @@ status_t brgemm_blocking_vmm(brgemm_desc_t *brg) {
+             best_bd_block_eff = bd_block_eff;
+         }
+     }
++    if (requested_bd_block && best_bd_block_eff == 0.f)
++        return status::invalid_arguments;
+     brg->bdb = brg->bcast_dim / brg->bd_block;
+     brg->bdb_tail = brg->bcast_dim % brg->bd_block;
+ 
+diff --git a/src/cpu/x64/jit_generator.hpp b/src/cpu/x64/jit_generator.hpp
+index 4e6bb4d..f655bc5 100644
+--- a/src/cpu/x64/jit_generator.hpp
++++ b/src/cpu/x64/jit_generator.hpp
+@@ -28,6 +28,9 @@
+ #include "cpu/x64/cpu_isa_traits.hpp"
+ 
+ #include "cpu/jit_utils/jit_utils.hpp"
++#ifdef DNNL_BUILD_MATOPT
++#include "cpu/matmul/matopt_backend.hpp"
++#endif
+ 
+ #if defined(_WIN32) && !defined(__GNUC__)
+ #define STRUCT_ALIGN(al, ...) __declspec(align(al)) __VA_ARGS__
+@@ -2752,9 +2755,18 @@ public:
+ 
+     /* All uni_ instructions -- apart from uni_vzeroupper() -- will comply with
+      * the max_cpu_isa argument */
++    static void *matopt_code_buffer() {
++#ifdef DNNL_BUILD_MATOPT
++        size_t size = 0;
++        const uint8_t *code = matopt::aot_replay_buffer(size);
++        if (code) return const_cast<uint8_t *>(code);
++#endif
++        return Xbyak::AutoGrow;
++    }
++
+     jit_generator_t(const char *name, cpu_isa_t max_cpu_isa = get_max_cpu_isa())
+         : Xbyak::MmapAllocator(name)
+-        , Xbyak::CodeGenerator(max_code_size, Xbyak::AutoGrow,
++        , Xbyak::CodeGenerator(max_code_size, matopt_code_buffer(),
+                   /*allocator=*/this)
+         , max_cpu_isa_(max_cpu_isa) {}
+ 
+@@ -2777,11 +2789,29 @@ public:
+     }
+ 
+     virtual status_t create_kernel() {
++#ifdef DNNL_BUILD_MATOPT
++        const uint8_t *replay_code = nullptr;
++        size_t replay_size = 0;
++        std::string replay_error;
++        if (matopt::aot_bind_replay(
++                    name(), replay_code, replay_size, replay_error)) {
++            if (!replay_code) {
++                matopt::set_error(replay_error);
++                return status::runtime_error;
++            }
++            jit_ker_ = replay_code;
++            return status::success;
++        }
++#endif
+         int err_code = Xbyak::GetError();
+         if (err_code == Xbyak::ERR_CANT_ALLOC) return status::out_of_memory;
+         if (err_code != Xbyak::ERR_NONE) return status::runtime_error;
+         generate();
+         jit_ker_ = getCode();
++#ifdef DNNL_BUILD_MATOPT
++        if (jit_ker_)
++            matopt::aot_record_generated(name(), jit_ker_, getSize());
++#endif
+         return (jit_ker_) ? status::success : status::runtime_error;
+     }
+ 
+diff --git a/src/cpu/x64/matmul/brgemm_matmul.cpp b/src/cpu/x64/matmul/brgemm_matmul.cpp
+index e42a436..e31f356 100644
+--- a/src/cpu/x64/matmul/brgemm_matmul.cpp
++++ b/src/cpu/x64/matmul/brgemm_matmul.cpp
+@@ -28,6 +28,9 @@
+ #include "cpu/x64/amx_tile_configure.hpp"
+ #include "cpu/x64/injectors/jit_uni_binary_injector.hpp"
+ #include "cpu/x64/matmul/brgemm_matmul.hpp"
++#if DNNL_BUILD_MATOPT
++#include "cpu/matmul/matopt_backend.hpp"
++#endif
+ 
+ // This is required to implement `can_use_gemm_fallback`.
+ #include "cpu/matmul/gemm_bf16_matmul.hpp"
+@@ -412,6 +415,19 @@ status_t brgemm_matmul_t<isa>::pd_t::init(engine_t *engine) {
+         brgattr.mem_advice = bgmmc_.mem_advice;
+         brgattr.max_bs = bs;
+         brgattr.hint_prefetchw = bgmmc_.hint_prefetchw;
++#if DNNL_BUILD_MATOPT
++        const auto *matopt_plan = matopt::active_plan();
++        const bool matopt_full_desc
++                = i_bs == 0 && i_M == 0 && i_N == 0 && i_K == 0;
++        if (matopt_plan && matopt_full_desc) {
++            brgattr.hint_bd_block = matopt_plan->bd_block;
++            brgattr.hint_ld_block2 = matopt_plan->ld_block2;
++            brgattr.hint_loop_order
++                    = matopt_plan->loop_order == matopt::loop_order_t::one_load
++                    ? brgemm_lo_bl_1load
++                    : brgemm_lo_default;
++        }
++#endif
+         if (is_superset(kernel_isa, avx512_core_amx)) {
+             brgattr.use_uker = true;
+             brgattr.use_interleave_stores = true;
+@@ -443,6 +459,11 @@ status_t brgemm_matmul_t<isa>::pd_t::init(engine_t *engine) {
+ 
+         CHECK(brgemm_desc_set_attr(&brg, brgattr));
+         CHECK(brgemm_desc_finalize(&brg));
++#if DNNL_BUILD_MATOPT
++        if (i_bs == 0 && i_M == 0 && i_N == 0 && i_K == 0)
++            matopt::capture_microtile(
++                    brg.bd_block, brg.ld_block2, brg.get_wsp_buffer_size());
++#endif
+ 
+         bgmmc_.wsp_tile_per_thr_bytes = nstl::max(
+                 brg.get_wsp_buffer_size(), bgmmc_.wsp_tile_per_thr_bytes);
+@@ -732,6 +753,7 @@ void brgemm_matmul_t<isa>::compute_kernel(
+ 
+     const auto wsp_tile = brgmm_ctx.get_tile_workspace(ithr);
+ 
++    const dim_t m = brgmm_ctx.get_M_idx(m_blk_idx, true);
+     const dim_t n = brgmm_ctx.get_N_idx(n_blk_idx, true);
+ 
+     const dim_t M = brgmm_ctx.get_M();
+@@ -774,6 +796,11 @@ void brgemm_matmul_t<isa>::compute_kernel(
+             ithr, b_idx, m_blk_idx, n_blk_idx);
+ 
+     if (gemm_batch > 0 && brg_ker_idx >= 0) {
++        matopt::perf_trace_record(ithr, brg_ker_idx,
++                static_cast<int>(nstl::min<dim_t>(bgmmc.M_blk, M - m)),
++                static_cast<int>(
++                        nstl::min<dim_t>(bgmmc.N_blk, bgmmc.N - n)),
++                gemm_batch * bgmmc.K_blk, gemm_batch);
+         const bool is_amx = is_superset(
+                 pd()->get_brg_desc(brg_ker_idx).isa_impl, avx512_core_amx);
+         const auto brg_kernel = brg_kernels_[brg_ker_idx].get();
+@@ -839,6 +866,11 @@ void brgemm_matmul_t<isa>::compute_kernel(
+         brgemm_palettes_.maybe_tile_configure(
+                 is_amx, prev_ker_idx, brg_ker_idx);
+         const auto brg_kernel_k_tail = brg_kernels_[brg_ker_idx].get();
++        matopt::perf_trace_record(ithr, brg_ker_idx,
++                static_cast<int>(nstl::min<dim_t>(bgmmc.M_blk, M - m)),
++                static_cast<int>(
++                        nstl::min<dim_t>(bgmmc.N_blk, bgmmc.N - n)),
++                bgmmc.K_tail, 1);
+ 
+         if (post_ops_applicable) {
+             void *scratch = is_amx
+diff --git a/src/cpu/x64/matmul/brgemm_matmul_utils.cpp b/src/cpu/x64/matmul/brgemm_matmul_utils.cpp
+index 9996347..b69a376 100644
+--- a/src/cpu/x64/matmul/brgemm_matmul_utils.cpp
++++ b/src/cpu/x64/matmul/brgemm_matmul_utils.cpp
+@@ -24,6 +24,9 @@
+ #include "cpu/x64/injectors/jit_uni_postops_injector.hpp"
+ #include "cpu/x64/matmul/amx_blocking_heuristics.hpp"
+ #include "cpu/x64/matmul/brgemm_matmul_utils.hpp"
++#if DNNL_BUILD_MATOPT
++#include "cpu/matmul/matopt_backend.hpp"
++#endif
+ #include "cpu/x64/matmul/postops_estimator.hpp"
+ #include "oneapi/dnnl/dnnl_debug.h"
+ 
+@@ -1814,6 +1817,9 @@ status_t init_brgemm_matmul_conf(cpu_isa_t isa, brgemm_matmul_conf_t &bgmmc,
+     // - nthr_K
+     VCHECK_BG(compute_blocking_heuristic(bgmmc, bm_conf_utils),
+             VERBOSE_BLOCKING_FAIL, "");
++#if DNNL_BUILD_MATOPT
++    VCHECK_BG(matopt::apply_plan(bgmmc), VERBOSE_BLOCKING_FAIL, "");
++#endif
+ 
+     if (bgmmc.wei_n_blk > bgmmc.N_blk && bgmmc.N != bgmmc.N_blk) {
+         assert(!bgmmc.is_runtime_N
+@@ -1877,6 +1883,9 @@ status_t init_brgemm_matmul_conf(cpu_isa_t isa, brgemm_matmul_conf_t &bgmmc,
+ 
+     // Sets things related to chunks and others
+     init_aux_values(bgmmc, src_d, weights_d, dst_d);
++#if DNNL_BUILD_MATOPT
++    matopt::capture(bgmmc);
++#endif
+ 
+     const bool need_store_prfw = bgmmc.N <= 14528
+             && ((bgmmc.M <= 768 && bgmmc.K <= 128)
 diff --git a/tools/matopt/CMakeLists.txt b/tools/matopt/CMakeLists.txt
 new file mode 100644
 index 0000000..8ac192a
@@ -1062,10 +1176,10 @@ index 0000000..8ac192a
 +add_test(NAME matopt_backend COMMAND matopt_backend_tests)
 diff --git a/tools/matopt/main.cpp b/tools/matopt/main.cpp
 new file mode 100644
-index 0000000..a094049
+index 0000000..979ca0a
 --- /dev/null
 +++ b/tools/matopt/main.cpp
-@@ -0,0 +1,1415 @@
+@@ -0,0 +1,1582 @@
 +/*******************************************************************************
 +* Copyright 2026
 +* Licensed under the Apache License, Version 2.0 (the "License");
@@ -2128,6 +2242,171 @@ index 0000000..a094049
 +    }
 +}
 +
++void perf_control(int control_fd, int ack_fd, const char *command) {
++    const std::string line = std::string(command) + "\n";
++    if (::write(control_fd, line.data(), line.size())
++            != static_cast<ssize_t>(line.size()))
++        throw std::runtime_error("cannot command perf control fd");
++    char ack[32];
++    const ssize_t count = ::read(ack_fd, ack, sizeof(ack));
++    if (count <= 0)
++        throw std::runtime_error("perf did not acknowledge control command");
++}
++
++int required_fd(const options_t &o, const char *name) {
++    if (!o.has(name))
++        throw std::runtime_error(std::string("missing --") + name);
++    char *end = nullptr;
++    const long value = std::strtol(o.get(name).c_str(), &end, 10);
++    if (!end || *end || value < 0 || value > std::numeric_limits<int>::max())
++        throw std::runtime_error(std::string("invalid --") + name);
++    return static_cast<int>(value);
++}
++
++void perf_diag_command(const options_t &o) {
++    if (!o.has("request") || !o.has("stage"))
++        throw std::runtime_error("perf-diag requires --request and --stage");
++    const std::set<std::string> stages {"hot_pipeline", "ideal_data",
++            "private_trace", "shared_trace", "full_driver", "empty_parallel",
++            "barriers", "noop_chunks", "instrumented_driver",
++            "memory_calibration", "cache_calibration"};
++    const std::string stage = o.get("stage");
++    if (!stages.count(stage))
++        throw std::runtime_error("unknown perf diagnostic stage: " + stage);
++    const int control_fd = required_fd(o, "perf-control-fd");
++    const int ack_fd = required_fd(o, "perf-ack-fd");
++    const std::string request_text = read_file(o.get("request"));
++    const std::string id = request_id(request_text);
++    const workload_t w = workload_from_request(request_text);
++    prepare_runner(w);
++    std::string identity;
++    const std::string fingerprint = fingerprint_for(w, identity);
++    check_expected_fingerprint(request_text, fingerprint);
++    plan_t plan;
++    std::string detail;
++    if (!parse_plan_json(request_text, plan, detail))
++        throw std::runtime_error(detail);
++    if (!(detail = validate_plan(w, plan)).empty())
++        throw std::runtime_error(detail);
++
++    engine eng(engine::kind::cpu, 0);
++    data_t data(w);
++    case_t evaluated(eng, data, &plan);
++    for (int i = 0; i < 3; ++i)
++        evaluated.execute();
++    dnnl::impl::cpu::matopt::perf_trace_begin();
++    const auto trace_begin = clock_t::now();
++    evaluated.execute();
++    const double traced_ms = elapsed_ms(trace_begin, clock_t::now());
++    auto trace_entries = dnnl::impl::cpu::matopt::perf_trace_end();
++    std::sort(trace_entries.begin(), trace_entries.end(),
++            [](const dnnl::impl::cpu::matopt::perf_trace_entry_t &a,
++                    const dnnl::impl::cpu::matopt::perf_trace_entry_t &b) {
++                return a.worker < b.worker
++                        || (a.worker == b.worker && a.order < b.order);
++            });
++    std::vector<double> samples;
++    samples.reserve(7);
++    perf_control(control_fd, ack_fd, "enable");
++    for (int sample_index = 0; sample_index < 7; ++sample_index) {
++        const auto begin = clock_t::now();
++        if (stage == "empty_parallel") {
++#pragma omp parallel
++            {
++                asm volatile("" ::: "memory");
++            }
++        } else if (stage == "barriers") {
++#pragma omp parallel
++            {
++                for (int i = 0; i < 100; ++i) {
++#pragma omp barrier
++                }
++            }
++        } else if (stage == "noop_chunks") {
++#pragma omp parallel for schedule(static)
++            for (int64_t i = 0; i < w.M; ++i)
++                asm volatile("" : : "r"(i) : "memory");
++        } else if (stage == "memory_calibration"
++                || stage == "cache_calibration") {
++            volatile float sink = 0;
++            const size_t stride = stage == "memory_calibration" ? 64 : 4096;
++            for (size_t i = 0; i < data.A.size(); i += stride / sizeof(float))
++                sink += data.A[i];
++            (void)sink;
++        } else {
++            evaluated.execute();
++        }
++        samples.push_back(elapsed_ms(begin, clock_t::now()));
++    }
++    perf_control(control_fd, ack_fd, "disable");
++    const double median = [&]() {
++        auto copy = samples;
++        std::sort(copy.begin(), copy.end());
++        return copy[copy.size() / 2];
++    }();
++    const double auxiliary = evaluated.persistent ? 0.0 : 0.0;
++    std::ostringstream sample_json;
++    sample_json << '[';
++    for (size_t i = 0; i < samples.size(); ++i) {
++        if (i) sample_json << ',';
++        sample_json << samples[i];
++    }
++    sample_json << ']';
++    const auto &f = evaluated.finalized;
++    const uint64_t flops = static_cast<uint64_t>(2) * w.M * w.N * w.K;
++    uint64_t traced_flops = 0;
++    std::ostringstream entries_json;
++    entries_json << '[';
++    for (size_t i = 0; i < trace_entries.size(); ++i) {
++        const auto &entry = trace_entries[i];
++        traced_flops += static_cast<uint64_t>(2) * entry.m * entry.n * entry.k;
++        if (i) entries_json << ',';
++        entries_json << "{\"worker\":" << entry.worker
++                     << ",\"variant\":" << entry.variant << ",\"m\":"
++                     << entry.m << ",\"n\":" << entry.n << ",\"k\":"
++                     << entry.k << ",\"batch\":" << entry.batch
++                     << ",\"order\":" << entry.order << '}';
++    }
++    entries_json << ']';
++    if (traced_flops != flops)
++        throw std::runtime_error("perf trace FLOPs do not equal 2MNK");
++    const uint64_t copy_bytes
++            = (plan.pack_a == pack_a_t::direct ? 0 : sizeof(float) * w.M * w.K)
++            + (plan.pack_b == pack_b_t::direct ? 0 : sizeof(float) * w.K * w.N);
++    const uint64_t reduction_flops
++            = f.nthr_k > 1 ? static_cast<uint64_t>(w.M * w.N)
++                            * static_cast<uint64_t>(f.nthr_k - 1)
++                           : 0;
++    std::cout << "{\"protocol_version\":1,\"request_id\":\""
++              << json_escape(id) << "\",\"status\":\"diagnosed\""
++              << ",\"fingerprint\":\"" << fingerprint << "\""
++              << ",\"stage\":\"" << json_escape(stage) << "\""
++              << ",\"stage_fidelity\":\""
++              << (stage == "full_driver" || stage == "instrumented_driver"
++                                 ? "native"
++                                 : "driver_proxy")
++              << "\""
++              << ",\"samples_ms\":" << sample_json.str()
++              << ",\"median_ms\":" << median
++              << ",\"auxiliary_ms\":" << auxiliary
++              << ",\"scheduling_ms\":0,\"driver_control_ms\":0"
++              << ",\"instrumentation_delta\":"
++              << (traced_ms - median) / std::max(median, 1e-12)
++              << ",\"finalized\":" << finalized_json(f)
++              << ",\"trace\":{\"schema\":\"perf_diag_trace_v1\""
++              << ",\"fidelity\":\"exact_worker_trace\""
++              << ",\"threads\":" << w.threads << ",\"flops\":" << flops
++              << ",\"copy_bytes\":" << copy_bytes
++              << ",\"reduction_flops\":" << reduction_flops
++              << ",\"worker_assignment\":\"static\",\"entries\":"
++              << entries_json.str()
++              << ",\"brgemm\":{\"M_blk\":" << f.M_blk
++              << ",\"N_blk\":" << f.N_blk << ",\"K_blk\":" << f.K_blk
++              << ",\"M_tail\":" << f.M_tail << ",\"N_tail\":" << f.N_tail
++              << ",\"K_tail\":" << f.K_tail
++              << ",\"batch_size\":" << f.brgemm_batch_size << "}}}\n";
++}
++
 +struct mapped_image_t {
 +    void *address = MAP_FAILED;
 +    size_t mapped_size = 0;
@@ -2468,6 +2747,8 @@ index 0000000..a094049
 +            baseline_command(o);
 +        else if (o.command == "evaluate")
 +            evaluate_command(o, false);
++        else if (o.command == "perf-diag")
++            perf_diag_command(o);
 +        else if (o.command == "capture-aot")
 +            capture_aot_command(o);
 +        else if (o.command == "validate-aot")
@@ -3172,10 +3453,10 @@ index 0000000..b80e92b
 +#endif
 diff --git a/tools/matopt/test_backend.cpp b/tools/matopt/test_backend.cpp
 new file mode 100644
-index 0000000..dc85e79
+index 0000000..f25485f
 --- /dev/null
 +++ b/tools/matopt/test_backend.cpp
-@@ -0,0 +1,192 @@
+@@ -0,0 +1,203 @@
 +/*******************************************************************************
 +* Copyright 2026
 +* Licensed under the Apache License, Version 2.0 (the "License");
@@ -3276,6 +3557,17 @@ index 0000000..dc85e79
 +
 +int main() {
 +    namespace aot = dnnl::impl::cpu::matopt;
++    aot::perf_trace_record(0, 1, 2, 3, 4, 1);
++    aot::perf_trace_begin();
++    aot::perf_trace_record(2, 7, 8, 9, 10, 3);
++    auto trace = aot::perf_trace_end();
++    aot::perf_trace_record(0, 1, 2, 3, 4, 1);
++    if (trace.size() != 1 || trace[0].worker != 2 || trace[0].variant != 7
++            || trace[0].m != 8 || trace[0].n != 9 || trace[0].k != 10
++            || trace[0].batch != 3 || trace[0].order != 0) {
++        std::cerr << "performance trace enable/disable failed\n";
++        return 1;
++    }
 +    const uint8_t fake_code[] {0xc3};
 +    aot::aot_begin_capture();
 +    aot::aot_set_group("matmul");
